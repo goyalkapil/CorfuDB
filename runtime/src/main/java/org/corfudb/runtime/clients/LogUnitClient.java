@@ -1,7 +1,6 @@
 package org.corfudb.runtime.clients;
 
 import com.google.common.collect.Range;
-import com.google.common.collect.RangeSet;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
 import io.netty.channel.ChannelHandlerContext;
@@ -14,6 +13,7 @@ import org.corfudb.runtime.exceptions.OverwriteException;
 import org.corfudb.runtime.exceptions.ReplexOverwriteException;
 import org.corfudb.util.serializer.Serializers;
 
+import java.io.IOException;
 import java.lang.invoke.MethodHandles;
 import java.util.Map;
 import java.util.Set;
@@ -160,6 +160,43 @@ public class LogUnitClient implements IClient {
     }
 
     /**
+     * Handle Bulk Read initiation response.
+     * @param msg   Incoming Message
+     * @param ctx   Context
+     * @param r     Router
+     */
+    @ClientHandler(type=CorfuMsgType.BULK_READ_INIT_RESPONSE)
+    private static Object handleBulkReadInitResponse(CorfuPayloadMsg<BulkReadInitResponse> msg,
+                                                 ChannelHandlerContext ctx, IClientRouter r) {
+        return msg.getPayload();
+    }
+
+    /**
+     * Handle Chunk received.
+     * @param msg   Incoming Message
+     * @param ctx   Context
+     * @param r     Router
+     */
+    @ClientHandler(type=CorfuMsgType.CHUNK_READ_RESPONSE)
+    private static Object handleBulkReadResponse(CorfuPayloadMsg<ChunkedFileResponse> msg,
+                                                 ChannelHandlerContext ctx, IClientRouter r) {
+        return msg.getPayload();
+    }
+
+    /**
+     * Handle error in reading file chunk.
+     * @param msg   Incoming Message
+     * @param ctx   Context
+     * @param r     Router
+     * @throws Exception
+     */
+    @ClientHandler(type=CorfuMsgType.CHUNK_READ_ERROR)
+    private static Object handleBulkReadError(CorfuMsg msg, ChannelHandlerContext ctx, IClientRouter r)
+            throws Exception {
+        throw new IOException("Bulk read request failed");
+    }
+
+    /**
      * Asynchronously write to the logging unit.
      *
      * @param address        The address to write to.
@@ -240,6 +277,27 @@ public class LogUnitClient implements IClient {
     public CompletableFuture<ReadResponse> read(UUID stream, Range<Long> offsetRange) {
         return router.sendMessageAndGetCompletable(
                 CorfuMsgType.READ_REQUEST.payloadMsg(new ReadRequest(offsetRange, stream)));
+    }
+
+    /**
+     * Initiate bulk read by requesting for the list of files to be copied.
+     * @return BulkReadInitResponse
+     */
+    public CompletableFuture<BulkReadInitResponse> initiateBulkFileRead() {
+        return router.sendMessageAndGetCompletable(CorfuMsgType.BULK_READ_INIT_REQUEST.msg());
+    }
+
+    /**
+     * Request for a file chunk of chunkSize number of bytes for the
+     * specified filename from the specified offset.
+     * @param filename  Name of file to be copied
+     * @param offset    Offset from where copying starts.
+     * @param chunkSize Length upto which chunk required.
+     * @return ChunkedFileResponse
+     */
+    public CompletableFuture<ChunkedFileResponse> readFileChunk(String filename, long offset, int chunkSize) {
+        return router.sendMessageAndGetCompletable(CorfuMsgType.CHUNK_READ_REQUEST.payloadMsg(
+                new ChunkedFileRequest(filename, offset, chunkSize)));
     }
 
     /**

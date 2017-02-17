@@ -54,6 +54,11 @@ public enum CorfuMsgType {
     GC_INTERVAL(36, new TypeToken<CorfuPayloadMsg<Long>>() {}),
     FORCE_COMPACT(37, TypeToken.of(CorfuMsg.class)),
     COMMIT(40, new TypeToken<CorfuPayloadMsg<CommitRequest>>() {}),
+    BULK_READ_INIT_REQUEST(41, TypeToken.of(CorfuMsg.class), true),
+    BULK_READ_INIT_RESPONSE(42, new TypeToken<CorfuPayloadMsg<BulkReadInitResponse>>() {}, true),
+    CHUNK_READ_REQUEST(43, new TypeToken<CorfuPayloadMsg<ChunkedFileRequest>>() {}, true),
+    CHUNK_READ_RESPONSE(44, new TypeToken<CorfuPayloadMsg<ChunkedFileResponse>>() {}, true),
+    CHUNK_READ_ERROR(45, TypeToken.of(CorfuMsg.class), true),
 
     WRITE_OK(50, TypeToken.of(CorfuMsg.class)),
     ERROR_TRIMMED(51, TypeToken.of(CorfuMsg.class)),

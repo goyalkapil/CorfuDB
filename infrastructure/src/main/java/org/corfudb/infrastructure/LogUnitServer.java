@@ -1,7 +1,12 @@
 package org.corfudb.infrastructure;
 
 import java.io.File;
+import java.io.FileInputStream;
+import java.io.IOException;
 import java.lang.invoke.MethodHandles;
+import java.util.Arrays;
+import java.util.List;
+import java.util.ArrayList;
 import java.util.Map;
 import java.util.Set;
 import java.util.SortedSet;
@@ -11,6 +16,8 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.zip.CRC32;
+import java.util.zip.Checksum;
 
 
 import com.github.benmanes.caffeine.cache.Caffeine;
@@ -30,6 +37,9 @@ import org.corfudb.infrastructure.log.InMemoryStreamLog;
 import org.corfudb.infrastructure.log.LogAddress;
 import org.corfudb.infrastructure.log.StreamLog;
 import org.corfudb.infrastructure.log.StreamLogFiles;
+import org.corfudb.protocols.wireprotocol.BulkReadInitResponse;
+import org.corfudb.protocols.wireprotocol.ChunkedFileRequest;
+import org.corfudb.protocols.wireprotocol.ChunkedFileResponse;
 import org.corfudb.protocols.wireprotocol.CommitRequest;
 import org.corfudb.protocols.wireprotocol.CorfuMsg;
 import org.corfudb.protocols.wireprotocol.CorfuMsgType;
@@ -228,6 +238,52 @@ public class LogUnitServer extends AbstractServer {
             r.sendResponse(ctx, msg, CorfuMsgType.READ_RESPONSE.payloadMsg(rr));
         } catch (DataCorruptionException e) {
             r.sendResponse(ctx, msg, CorfuMsgType.ERROR_DATA_CORRUPTION.msg());
+        }
+    }
+
+    /**
+     * Service an incoming bulk read initialization request.
+     */
+    @ServerHandler(type = CorfuMsgType.BULK_READ_INIT_REQUEST)
+    public void bulkReadInitRequestHandler(CorfuMsg msg, ChannelHandlerContext ctx, IServerRouter r) {
+        String logdirPath = opts.get("--log-path") + File.separator + "log";
+        File logdir = new File(logdirPath);
+        List<String> fileNames = new ArrayList<>();
+        if (logdir.list() != null) {
+            Arrays.stream(logdir.list()).forEach(fileNames::add);
+        }
+        r.sendResponse(ctx, msg, CorfuMsgType.BULK_READ_INIT_RESPONSE.payloadMsg(new BulkReadInitResponse(fileNames)));
+    }
+
+    /**
+     * Service an incoming chunk read request.
+     */
+    @ServerHandler(type = CorfuMsgType.CHUNK_READ_REQUEST)
+    public void bulkReadRequestHandler(CorfuPayloadMsg<ChunkedFileRequest> msg, ChannelHandlerContext ctx, IServerRouter r) {
+
+        String logdirPath = opts.get("--log-path") + File.separator + "log";
+        String fileName = msg.getPayload().getFileName();
+        long offset = msg.getPayload().getOffset();
+        int chunkSize = msg.getPayload().getChunkSize();
+
+        try {
+            File logFile = new File(logdirPath + File.separator + fileName);
+            FileInputStream fileInputStream = new FileInputStream(logFile);
+            fileInputStream.skip(offset);
+            byte[] fileChunk = new byte[chunkSize < fileInputStream.available() ? chunkSize : fileInputStream.available()];
+            Checksum checksum = new CRC32();
+            if (fileInputStream.available() > 0) {
+                int bytesRead = fileInputStream.read(fileChunk);
+                offset = bytesRead == -1 ? -1 : (offset + bytesRead);
+            }
+            checksum.update(fileChunk, 0, fileChunk.length);
+            ChunkedFileResponse chunkedFileResponse = new ChunkedFileResponse(
+                    fileName, offset, fileInputStream.available(), fileChunk, checksum.getValue(), logFile.lastModified());
+            r.sendResponse(ctx, msg, CorfuMsgType.CHUNK_READ_RESPONSE.payloadMsg(chunkedFileResponse));
+            fileInputStream.close();
+        } catch (IOException ioe) {
+            log.error("IOException in bulk read : {}", ioe.getMessage());
+            r.sendResponse(ctx, msg, CorfuMsgType.CHUNK_READ_ERROR.msg());
         }
     }
 
