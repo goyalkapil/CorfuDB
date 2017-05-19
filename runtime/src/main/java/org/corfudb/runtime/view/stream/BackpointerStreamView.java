@@ -1,13 +1,16 @@
 package org.corfudb.runtime.view.stream;
 
 import lombok.extern.slf4j.Slf4j;
-import org.corfudb.protocols.wireprotocol.*;
+import org.corfudb.protocols.wireprotocol.ILogData;
+import org.corfudb.protocols.wireprotocol.TokenResponse;
 import org.corfudb.runtime.CorfuRuntime;
 import org.corfudb.runtime.exceptions.OverwriteException;
 import org.corfudb.runtime.view.Address;
 
+import javax.annotation.Nonnull;
 import java.util.*;
 import java.util.function.Function;
+import java.util.stream.Collectors;
 
 /** A view of a stream implemented with backpointers.
  *
@@ -19,12 +22,6 @@ import java.util.function.Function;
  */
 @Slf4j
 public class BackpointerStreamView extends AbstractQueuedStreamView {
-
-    /**
-     * The number of retries before attempting a hole fill.
-     * TODO: this constant should come from the runtime.
-     */
-    final int NUM_RETRIES = 3;
 
     /** Create a new backpointer stream view.
      *
@@ -70,14 +67,10 @@ public class BackpointerStreamView extends AbstractQueuedStreamView {
             // to the client.
             try {
                 runtime.getAddressSpaceView()
-                        .write(tokenResponse.getToken(),
-                                Collections.singleton(ID),
-                                object,
-                                tokenResponse.getBackpointerMap(),
-                                tokenResponse.getStreamAddresses());
+                        .write(tokenResponse, object);
                 // The write completed successfully, so we return this
                 // address to the client.
-                return tokenResponse.getToken();
+                return tokenResponse.getToken().getTokenValue();
             } catch (OverwriteException oe) {
                 log.trace("Overwrite occurred at {}", tokenResponse);
                 // We got overwritten, so we call the deacquisition callback
@@ -92,7 +85,7 @@ public class BackpointerStreamView extends AbstractQueuedStreamView {
                 // overwritten.
                 tokenResponse = runtime.getSequencerView()
                         .nextToken(Collections.singleton(ID),
-                             1, true, false);
+                             1);
             }
         }
     }
@@ -111,6 +104,16 @@ public class BackpointerStreamView extends AbstractQueuedStreamView {
             return runtime.getAddressSpaceView().read(address);
     }
 
+    @Nonnull
+    @Override
+    protected List<ILogData> readAll(@Nonnull List<Long> addresses) {
+        Map<Long, ILogData> dataMap =
+            runtime.getAddressSpaceView().read(addresses);
+        return addresses.stream()
+                .map(x -> dataMap.get(x))
+                .collect(Collectors.toList());
+    }
+
     /**
      * {@inheritDoc}
      *
@@ -122,7 +125,7 @@ public class BackpointerStreamView extends AbstractQueuedStreamView {
     public boolean getHasNext(QueuedStreamContext context) {
         return  context.readQueue.isEmpty() ||
                 runtime.getSequencerView()
-                .nextToken(Collections.singleton(context.id), 0).getToken()
+                .nextToken(Collections.singleton(context.id), 0).getToken().getTokenValue()
                         > context.globalPointer;
     }
 
@@ -133,12 +136,30 @@ public class BackpointerStreamView extends AbstractQueuedStreamView {
     public void close() {}
 
 
+    protected boolean fillFromResolved(final long maxGlobal,
+                                       final QueuedStreamContext context) {
+        // There's nothing to read if we're already past maxGlobal.
+        if (maxGlobal < context.globalPointer) {
+            return false;
+        }
+        // Get the subset of the resolved queue, which starts at
+        // globalPointer and ends at maxAddress inclusive.
+        NavigableSet<Long> resolvedSet =
+                context.resolvedQueue.subSet(context.globalPointer,
+                        false, maxGlobal, true);
+        // Put those elements in the read queue
+        context.readQueue.addAll(resolvedSet);
+        return !context.readQueue.isEmpty();
+    }
+
     /**
      * {@inheritDoc}
      */
     @Override
     protected boolean fillReadQueue(final long maxGlobal,
                                  final QueuedStreamContext context) {
+        log.trace("Read_Fill_Queue[{}] Max: {}, Current: {}, Resolved: {} - {}", this,
+                maxGlobal, context.globalPointer, context.maxResolution, context.minResolution);
         // The maximum address we will fill to.
         final long maxAddress =
                 Long.min(maxGlobal, context.maxGlobalAddress);
@@ -149,84 +170,63 @@ public class BackpointerStreamView extends AbstractQueuedStreamView {
             return false;
         }
 
-        // First, we fetch the current token (backpointer) from the sequencer.
-        final long latestToken = runtime.getSequencerView()
-                .nextToken(Collections.singleton(context.id), 0)
-                .getToken();
+        // If everything is available in the resolved
+        // queue, use it
+        if (context.maxResolution > maxAddress &&
+                context.minResolution < context.globalPointer) {
+            return fillFromResolved(maxGlobal, context);
+        }
 
-        // If the backpointer was unwritten, return, there is nothing to do
-        if (latestToken == Address.NEVER_READ) {
+        Long latestTokenValue = null;
+
+        // If the max has been resolved, use it.
+        if (maxGlobal != Address.MAX) {
+            latestTokenValue = context.resolvedQueue.ceiling(maxGlobal);
+        }
+
+        // If we don't have a larger token in resolved, or the request was for
+        // a linearized read, fetch the token from the sequencer.
+        if (latestTokenValue == null || maxGlobal == Address.MAX) {
+            latestTokenValue = runtime.getSequencerView()
+                    .nextToken(Collections.singleton(context.id), 0)
+                    .getToken().getTokenValue();
+        }
+
+        // If there is no infomation on the tail of the stream, return, there is nothing to do
+        if (Address.nonAddress(latestTokenValue)) {
+
+            // sanity check:
+            // curretly, the only possible non-address return value for a token-query is Address.NON_EXIST
+            if (latestTokenValue != Address.NON_EXIST)
+                log.warn("TOKEN[{}] unexpected return value", latestTokenValue);
+
             return false;
+        }
+
+        // If everything is available in the resolved
+        // queue, use it
+        if (context.maxResolution > latestTokenValue &&
+                context.minResolution < context.globalPointer) {
+            return fillFromResolved(latestTokenValue, context);
         }
 
         // Now we start traversing backpointers, if they are available. We
         // start at the latest token and go backward, until we reach the
         // log pointer. For each address which is less than
         // maxGlobalAddress, we insert it into the read queue.
-        long currentRead = latestToken;
+        long currentRead = latestTokenValue;
 
         while (currentRead > context.globalPointer &&
-                currentRead != Address.NEVER_READ) {
+                Address.isAddress(currentRead)) {
+            // We've somehow reached a read we already know about.
+            if (context.readQueue.contains(currentRead)) {
+                break;
+            }
+
+            log.trace("Read_Fill_Queue[{}] Read {}", this, currentRead);
             // Read the entry in question.
             ILogData currentEntry =
                     runtime.getAddressSpaceView().read(currentRead);
-
-            // If the current entry is unwritten, we need to fill it,
-            // otherwise we cannot resolve the stream.
-            if (currentEntry.getType() == DataType.EMPTY) {
-
-                // We'll retry the read a few times, we should only need
-                // to fill if a client has actually failed, which should
-                // be a relatively rare event.
-
-                for (int i = 0; i < NUM_RETRIES; i++) {
-                    currentEntry =
-                            runtime.getAddressSpaceView().read(currentRead);
-                    if (currentEntry.getType() != DataType.EMPTY) {
-                        break;
-                    }
-                    // Wait 1 << i ms (exp. backoff) before retrying again.
-                    try {
-                        Thread.sleep(1 << i);
-                    } catch (InterruptedException ie) {
-                        throw new RuntimeException(ie);
-                    }
-                }
-
-                // If hole filling is disabled, we will retry forever.
-                if (runtime.isHoleFillingDisabled()) {
-                    int i = 0; // For exponential backoff.
-                    while (currentEntry.getType() == DataType.EMPTY) {
-                        currentEntry =
-                                runtime.getAddressSpaceView().read(currentRead);
-                        try {
-                            Thread.sleep(1 << i);
-                            i++;
-                        } catch (InterruptedException ie) {
-                            throw new RuntimeException(ie);
-                        }
-                    }
-                }
-
-                // If we STILL don't have the data, now we need to do a hole
-                // fill.
-                if (currentEntry.getType() == DataType.EMPTY) {
-                    try {
-                        runtime.getAddressSpaceView().fillHole(currentRead);
-                        // If we reached here, our hole fill was successful.
-                        currentEntry = LogData.HOLE;
-                    } catch (OverwriteException oe) {
-                        // If we reached here, this means the remote client
-                        // must have successfully completed the write and
-                        // we can continue.
-                        currentEntry =
-                                runtime.getAddressSpaceView().read(currentRead);
-                    }
-                }
-
-                // At this point the hole is filled or has the data and we
-                // can continue.
-            }
 
             // If the entry contains this context's stream,
             // we add it to the read queue.
@@ -234,18 +234,41 @@ public class BackpointerStreamView extends AbstractQueuedStreamView {
                 context.readQueue.add(currentRead);
             }
 
+            // If everything left is available in the resolved
+            // queue, use it
+            if (context.maxResolution > currentRead &&
+                    context.minResolution < context.globalPointer) {
+                return fillFromResolved(latestTokenValue, context);
+            }
+
+            // If the start is available in the resolved queue,
+            // use it.
+            if (context.minResolution <= context.globalPointer) {
+                fillFromResolved(maxGlobal, context);
+            }
+
             // Now we calculate the next entry to read.
             // If we have a backpointer, we'll use that for our next read.
             if (!runtime.backpointersDisabled &&
                     currentEntry.hasBackpointer(context.id)) {
+                log.trace("Read_Fill_Queue[{}] Backpointer {}->{}", this,
+                        currentRead, currentEntry.getBackpointer(context.id));
                 currentRead = currentEntry.getBackpointer(context.id);
             }
             // Otherwise, our next read is the previous entry.
             else {
                 currentRead = currentRead - 1L;
             }
+
+            // If the next read is before or equal to the max resolved
+            // we need to stop.
+            if (context.maxResolution >= currentRead) {
+                break;
+            }
+
         }
 
+        log.debug("Read_Fill_Queue[{}] Filled queue with {}", this, context.readQueue);
         return !context.readQueue.isEmpty();
     }
 }

@@ -1,13 +1,66 @@
 package org.corfudb.runtime.object.transactions;
 
 import org.corfudb.runtime.exceptions.TransactionAbortedException;
+import org.corfudb.runtime.object.ConflictParameterClass;
 import org.junit.Test;
+
+import java.util.stream.Collectors;
+
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
  * Created by mwei on 11/16/16.
  */
 public class OptimisticTransactionContextTest extends AbstractTransactionContextTest {
+    @Override
+    public void TXBegin() { OptimisticTXBegin(); }
+
+
+    /** Checks that the fine-grained conflict set is correctly produced
+     * by the annotation framework.
+     */
+    @Test
+    public void checkConflictParameters() {
+        ConflictParameterClass testObject = getDefaultRuntime()
+                .getObjectsView().build()
+                .setStreamName("my stream")
+                .setType(ConflictParameterClass.class)
+                .open();
+
+        final String TEST_0 = "0";
+        final String TEST_1 = "1";
+        final int TEST_2 = 2;
+        final int TEST_3 = 3;
+        final String TEST_4 = "4";
+        final String TEST_5 = "5";
+
+        getRuntime().getObjectsView().TXBegin();
+        // RS=TEST_0
+        testObject.accessorTest(TEST_0, TEST_1);
+        // WS=TEST_3
+        testObject.mutatorTest(TEST_2, TEST_3);
+        // WS,RS=TEST_4
+        testObject.mutatorAccessorTest(TEST_4, TEST_5);
+
+        // Assert that the conflict set contains TEST_1, TEST_4
+        assertThat(TransactionalContext.getCurrentContext()
+                .getReadSetInfo()
+                .getReadSetConflicts().values().stream()
+                .flatMap(x -> x.stream())
+                .collect(Collectors.toList()))
+                .contains(Integer.valueOf(TEST_0.hashCode()));
+
+        // in optimistic mode, assert that the conflict set does NOT contain TEST_2, TEST_4
+        assertThat(TransactionalContext.getCurrentContext()
+                .getReadSetInfo()
+                .getReadSetConflicts().values().stream()
+                .flatMap(x -> x.stream())
+                .collect(Collectors.toList()))
+                .doesNotContain(Integer.valueOf(TEST_3), Integer.valueOf(TEST_4));
+
+        getRuntime().getObjectsView().TXAbort();
+    }
+
 
     /** In an optimistic transaction, we should be able to
      *  read our own writes in the same thread.
@@ -15,7 +68,7 @@ public class OptimisticTransactionContextTest extends AbstractTransactionContext
     @Test
     public void readOwnWrites()
     {
-        t(1, this::TXBegin);
+        t(1, this::OptimisticTXBegin);
         t(1, () -> put("k" , "v"));
         t(1, () -> get("k"))
                             .assertResult()
@@ -29,8 +82,8 @@ public class OptimisticTransactionContextTest extends AbstractTransactionContext
     @Test
     public void otherThreadCannotReadOptimisticWrites()
     {
-        t(1, this::TXBegin);
-        t(2, this::TXBegin);
+        t(1, this::OptimisticTXBegin);
+        t(2, this::OptimisticTXBegin);
         // T1 inserts k,v1 optimistically. Other threads
         // should not see this optimistic put.
         t(1, () -> put("k", "v1"));
@@ -47,6 +100,42 @@ public class OptimisticTransactionContextTest extends AbstractTransactionContext
                             .isNotEqualTo("v2");
     }
 
+    /** Ensure that, upon two consecutive nested transactions, the latest transaction can
+     * see optimistic updates from previous ones.
+     *
+     */
+    @Test
+    public void OptimisticStreamGetUpdatedCorrectlyWithNestedTransaction(){
+        t(1, this::OptimisticTXBegin);
+        t(1, () -> put("k", "v0"));
+
+        // Start first nested transaction
+        t(1, this::OptimisticTXBegin);
+        t(1, () -> get("k"))
+                            .assertResult()
+                            .isEqualTo("v0");
+        t(1, () -> put("k", "v1"));
+        t(1, this::TXEnd);
+        // End first nested transaction
+
+        // Start second nested transaction
+        t(1, this::OptimisticTXBegin);
+        t(1, () -> get("k"))
+                            .assertResult()
+                            .isEqualTo("v1");
+        t(1, () -> put("k", "v2"));
+        t(1, this::TXEnd);
+        // End second nested transaction
+
+        t(1, () -> get("k"))
+                            .assertResult()
+                            .isEqualTo("v2");
+        t(1, this::TXEnd);
+        assertThat(getMap())
+                .containsEntry("k", "v2");
+
+    }
+
     /** Threads that start a transaction at the same time
      * (with the same timestamp) should cause one thread
      * to abort while the other succeeds.
@@ -59,8 +148,8 @@ public class OptimisticTransactionContextTest extends AbstractTransactionContext
         t(1, () -> put("k1", "v1"));
         t(1, () -> put("k2", "v2"));
         // Now T1 and T2 both start transactions and read v0.
-        t(1, this::TXBegin);
-        t(2, this::TXBegin);
+        t(1, this::OptimisticTXBegin);
+        t(2, this::OptimisticTXBegin);
         t(1, () -> get("k"))
                     .assertResult()
                     .isEqualTo("v0");
@@ -92,13 +181,13 @@ public class OptimisticTransactionContextTest extends AbstractTransactionContext
         // We start without a transaction and put k,v1
         t(1, () -> put("k", "v1"));
         // Now we start a transaction and put k,v2
-        t(1, this::TXBegin);
+        t(1, this::OptimisticTXBegin);
         t(1, () -> put("k", "v2"))
                     .assertResult() // put should return the previous value
                     .isEqualTo("v1"); // which is v1.
         // Now we start a nested transaction. It should
         // read v2.
-        t(1, this::TXBegin);
+        t(1, this::OptimisticTXBegin);
         t(1, () -> get("k"))
                     .assertResult()
                     .isEqualTo("v2");
@@ -126,14 +215,14 @@ public class OptimisticTransactionContextTest extends AbstractTransactionContext
     @Test
     public void nestedTransactionsAreIsolatedAcrossThreads() {
         // Start a transaction on both threads.
-        t(1, this::TXBegin);
-        t(2, this::TXBegin);
+        t(1, this::OptimisticTXBegin);
+        t(2, this::OptimisticTXBegin);
         // Put k, v1 on T1 and k, v2 on T2.
         t(1, () -> put("k", "v1"));
         t(2, () -> put("k", "v2"));
         // Now, start a nested transaction on both threads.
-        t(1, this::TXBegin);
-        t(2, this::TXBegin);
+        t(1, this::OptimisticTXBegin);
+        t(2, this::OptimisticTXBegin);
         // T1 should see v1 and T2 should see v2.
         t(1, () -> get("k"))
                 .assertResult()
@@ -176,6 +265,32 @@ public class OptimisticTransactionContextTest extends AbstractTransactionContext
                 .doesNotContainEntry("k", "v4");
     }
 
+    /**
+     * Check that on abortion of a nested transaction
+     * the modifications that happened within it are not
+     * leaked into the parent transaction.
+     */
+    @Test
+    public void nestedTransactionCanBeAborted() {
+        t(1, this::OptimisticTXBegin);
+        t(1, () -> put("k", "v1"));
+        t(1, () -> get("k"))
+                        .assertResult()
+                        .isEqualTo("v1");
+        t(1, this::OptimisticTXBegin);
+        t(1, () -> put("k", "v2"));
+        t(1, () -> get("k"))
+                        .assertResult()
+                        .isEqualTo("v2");
+        t(1, this::TXAbort);
+        t(1, () -> get("k"))
+                        .assertResult()
+                        .isEqualTo("v1");
+        t(1, this::TXEnd);
+        assertThat(getMap())
+                .containsEntry("k", "v1");
+    }
+
     /** This test makes sure that a write-only transaction properly
      * commits its updates, even if there are no accesses
      * during the transaction.
@@ -183,7 +298,7 @@ public class OptimisticTransactionContextTest extends AbstractTransactionContext
     @Test
     public void writeOnlyTransactionCommitsInMemory() {
         // Write twice to the transaction without a read
-        TXBegin();
+        OptimisticTXBegin();
         write("k", "v1");
         write("k", "v2");
         TXEnd();
@@ -192,12 +307,5 @@ public class OptimisticTransactionContextTest extends AbstractTransactionContext
         // of the most recent write.
         assertThat(getMap())
                 .containsEntry("k", "v2");
-    }
-
-    @Override
-    protected void TXBegin() {
-        getRuntime().getObjectsView().TXBuild()
-                .setType(TransactionType.OPTIMISTIC)
-                .begin();
     }
 }

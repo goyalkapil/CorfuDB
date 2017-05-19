@@ -6,16 +6,22 @@ import lombok.*;
 import lombok.extern.slf4j.Slf4j;
 import org.corfudb.runtime.CorfuRuntime;
 import org.corfudb.runtime.clients.*;
+import org.corfudb.runtime.exceptions.QuorumUnreachableException;
 import org.corfudb.runtime.exceptions.WrongEpochException;
-import org.corfudb.util.CFUtils;
+import org.corfudb.runtime.view.replication.*;
+import org.corfudb.runtime.view.stream.BackpointerStreamView;
+import org.corfudb.runtime.view.stream.IStreamView;
 
+import java.util.Map;
 import java.util.HashSet;
 import java.util.List;
+import java.util.ArrayList;
 import java.util.Set;
 import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.function.Function;
+import java.util.concurrent.CompletableFuture;
 import java.util.stream.Stream;
+
+import static java.util.Objects.requireNonNull;
 
 /**
  * This class represents the layout of a Corfu instance.
@@ -23,13 +29,15 @@ import java.util.stream.Stream;
  */
 @Slf4j
 @Data
-@ToString(exclude = {"runtime", "replicationViewCache"})
+@ToString(exclude = {"runtime"})
 @EqualsAndHashCode
 public class Layout implements Cloneable {
     /**
      * A Gson parser.
      */
-    static final Gson parser = new GsonBuilder().create();
+    static final Gson parser = new GsonBuilder()
+            .registerTypeAdapter(Layout.class, new LayoutDeserializer())
+            .create();
     /**
      * A list of layout servers in the layout.
      */
@@ -46,6 +54,11 @@ public class Layout implements Cloneable {
     @Getter
     List<LayoutSegment> segments;
     /**
+     * A list of unresponsive nodes in the layout.
+     */
+    @Getter
+    List<String> unresponsiveServers;
+    /**
      * The epoch of this layout.
      */
     @Getter
@@ -59,35 +72,60 @@ public class Layout implements Cloneable {
     @Setter
     transient CorfuRuntime runtime;
 
-    transient ConcurrentHashMap<LayoutSegment, AbstractReplicationView> replicationViewCache;
+    /* Defensive constructor since we can create a Layout from a JSON file. JSON deserialize is forced through
+     * this constructor.
+     */
+    public Layout(@NonNull List<String> layoutServers, @NonNull List<String> sequencers,
+                  @NonNull List<LayoutSegment> segments, @NonNull List<String> unresponsiveServers, long epoch) {
 
-    public Layout(List<String> layoutServers, List<String> sequencers, List<LayoutSegment> segments, long epoch) {
         this.layoutServers = layoutServers;
         this.sequencers = sequencers;
         this.segments = segments;
+        this.unresponsiveServers = unresponsiveServers;
         this.epoch = epoch;
+
+        /* Assert that we constructed a valid Layout */
+        if (this.layoutServers.size() == 0) throw new IllegalArgumentException("Empty list of LayoutServers");
+        if (this.sequencers.size() == 0) throw new IllegalArgumentException("Empty list of Sequencers");
+        if (this.segments.size() == 0) throw new IllegalArgumentException("Empty list of segments");
+        for (Layout.LayoutSegment segment : segments) {
+            requireNonNull(segment.stripes);
+            if (segment.stripes.size() == 0) throw new IllegalArgumentException("One segment has an empty list of stripes");
+        }
+    }
+
+    public Layout(List<String> layoutServers, List<String> sequencers, List<LayoutSegment> segments, long epoch) {
+        this(layoutServers, sequencers, segments, new ArrayList<String>(), epoch);
     }
 
     /**
      * Get a layout from a JSON string.
      */
     public static Layout fromJSONString(String json) {
-        return parser.fromJson(json, Layout.class);
+        /* Empty Json file creates an null Layout */
+        return requireNonNull(parser.fromJson(json, Layout.class));
     }
 
     /**
      * Move each server in the system to the epoch of this layout.
      *
      * @throws WrongEpochException If any server is in a higher epoch.
+     * @throws QuorumUnreachableException If enough number of servers cannot be sealed.
      */
     public void moveServersToEpoch()
-            throws WrongEpochException {
+            throws WrongEpochException, QuorumUnreachableException {
         log.debug("Requested move of servers to new epoch {} servers are {}", epoch, getAllServers());
-        // Collect a list of all servers in the system.
-        getAllServers().stream()
-                .map(runtime::getRouter)
-                .map(x -> x.getClient(BaseClient.class))
-                .forEach(x -> CFUtils.getUninterruptibly(x.setRemoteEpoch(epoch)));
+
+        // Set remote epoch on all servers in layout.
+        Map<String, CompletableFuture<Boolean>> resultMap = SealServersHelper.asyncSetRemoteEpoch(this);
+
+        // Validate if we received enough layout server responses.
+        SealServersHelper.waitForLayoutSeal(layoutServers, resultMap);
+        // Validate if we received enough log unit server responses depending on the replication mode.
+        for (LayoutSegment layoutSegment : getSegments()) {
+            layoutSegment.getReplicationMode().validateSegmentSeal(layoutSegment, resultMap);
+        }
+        log.debug("Layout has been sealed successfully.");
     }
 
     /**
@@ -97,17 +135,11 @@ public class Layout implements Cloneable {
      */
     public Set<String> getAllServers() {
         Set<String> allServers = new HashSet<>();
-        layoutServers.stream()
-                .forEach(allServers::add);
-        sequencers.stream()
-                .forEach(allServers::add);
-        segments.stream()
-                .forEach(x -> {
-                    x.getStripes().stream()
-                            .forEach(y ->
-                                    y.getLogServers().stream()
-                                            .forEach(allServers::add));
-                });
+        layoutServers.forEach(allServers::add);
+        sequencers.forEach(allServers::add);
+        segments.forEach(x ->
+                x.getStripes().forEach(y ->
+                        y.getLogServers().forEach(allServers::add)));
         return allServers;
     }
 
@@ -187,15 +219,6 @@ public class Layout implements Cloneable {
         throw new RuntimeException("Unmapped address!");
     }
 
-    public int getNumReplexUnits(int whichReplex) {
-        return segments.get(segments.size() - 1).replexes.get(whichReplex).getLogServers().size();
-    }
-
-    public int getReplexUnitIndex(int whichReplex, UUID streamID) {
-        return streamID.hashCode() % getNumReplexUnits(whichReplex);
-
-    }
-
     public LayoutSegment getSegment(long globalAddress) {
         for (LayoutSegment ls : segments) {
             if (ls.start <= globalAddress && (ls.end > globalAddress || ls.end == -1)) {
@@ -241,10 +264,7 @@ public class Layout implements Cloneable {
         return runtime.getRouter(getStripe(address).getLogServers().get(index)).getClient(LogUnitClient.class);
     }
 
-    public LogUnitClient getReplexLogUnitClient(int whichReplex, int index) {
-        return runtime.getRouter(getSegments().get(getSegments().size() - 1).replexes.get(whichReplex)
-                .getLogServers().get(index)).getClient(LogUnitClient.class);
-    }
+
     /**
      * Get the layout as a JSON string.
      */
@@ -319,11 +339,82 @@ public class Layout implements Cloneable {
     }
 
     public enum ReplicationMode {
-        CHAIN_REPLICATION,
-        QUORUM_REPLICATION,
-        REPLEX,
-        NO_REPLICATION
+        CHAIN_REPLICATION {
+            @Override
+            public void validateSegmentSeal(LayoutSegment layoutSegment,
+                                            Map<String, CompletableFuture<Boolean>> completableFutureMap)
+                    throws QuorumUnreachableException {
+                SealServersHelper.waitForChainSegmentSeal(layoutSegment, completableFutureMap);
+            }
+
+            @Override
+            public IStreamView  getStreamView(CorfuRuntime r, UUID streamId) {
+                return new BackpointerStreamView(r, streamId);
+            }
+
+            @Override
+            public IReplicationProtocol getReplicationProtocol(CorfuRuntime r) {
+                if (r.isHoleFillingDisabled()) {
+                    return new ChainReplicationProtocol(new NeverHoleFillPolicy(100));
+                } else {
+                    return new ChainReplicationProtocol(new ReadWaitHoleFillPolicy(100,
+                            r.getParameters().getHoleFillRetry()));
+                }
+            }
+        },
+        QUORUM_REPLICATION {
+            @Override
+            public void validateSegmentSeal(LayoutSegment layoutSegment,
+                                            Map<String, CompletableFuture<Boolean>> completableFutureMap)
+                    throws QuorumUnreachableException {
+                //TODO: Take care of log unit servers which were not sealed.
+                SealServersHelper.waitForQuorumSegmentSeal(layoutSegment, completableFutureMap);
+            }
+
+
+            @Override
+            public IStreamView getStreamView(CorfuRuntime r, UUID streamId) {
+                return new BackpointerStreamView(r, streamId);
+            }
+
+            @Override
+            public IReplicationProtocol getReplicationProtocol(CorfuRuntime r) {
+                if (r.isHoleFillingDisabled()) {
+                    return new QuorumReplicationProtocol(new NeverHoleFillPolicy(100));
+                } else {
+                    return new QuorumReplicationProtocol(new ReadWaitHoleFillPolicy(100,
+                            r.getParameters().getHoleFillRetry()));
+                }
+            }
+
+        }, NO_REPLICATION {
+            @Override
+            public void validateSegmentSeal(LayoutSegment layoutSegment,
+                                            Map<String, CompletableFuture<Boolean>> completableFutureMap)
+                    throws QuorumUnreachableException {
+                throw new UnsupportedOperationException("unsupported seal");
+            }
+
+            @Override
+            public IStreamView getStreamView(CorfuRuntime r, UUID streamId) {
+                throw new UnsupportedOperationException("Stream view used without a replication mode");
+            }
+        };
+
+        /**
+         * Seals the layout segment.
+         */
+        public abstract void validateSegmentSeal(LayoutSegment layoutSegment,
+                                                 Map<String, CompletableFuture<Boolean>> completableFutureMap)
+                throws QuorumUnreachableException;
+
+        public abstract IStreamView getStreamView(CorfuRuntime r, UUID streamId);
+
+        public IReplicationProtocol getReplicationProtocol(CorfuRuntime r) {
+            throw new UnsupportedOperationException();
+        }
     }
+
 
     @Data
     @Getter
@@ -346,26 +437,25 @@ public class Layout implements Cloneable {
          */
         List<LayoutStripe> stripes;
 
-        public LayoutSegment(ReplicationMode replicationMode, long start, long end, List<LayoutStripe> stripes) {
+        public LayoutSegment(@NonNull ReplicationMode replicationMode, long start, long end,
+                             @NonNull List<LayoutStripe> stripes) {
             this.replicationMode = replicationMode;
             this.start = start;
             this.end = end;
             this.stripes = stripes;
+
         }
 
-        List<LayoutStripe> replexes; // A list of replexes. Each LayoutStripe is a replex, because it is just a list of
-                                     // servers. Select one node from each LayoutStripe (replex) to append to.
-                                     // For now, there is only 1 replex, which are the stream homes.
-
         public int getNumberOfStripes() { return stripes.size(); }
-
-        public int getNumberOfReplexes() { return replexes.size(); }
     }
 
     @Data
     @Getter
-    @AllArgsConstructor
     public static class LayoutStripe {
         final List<String> logServers;
+
+        public LayoutStripe(@NonNull List<String> logServers) {
+            this.logServers = logServers;
+        }
     }
 }

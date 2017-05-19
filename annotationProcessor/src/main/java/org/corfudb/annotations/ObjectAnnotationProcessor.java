@@ -1,6 +1,7 @@
 package org.corfudb.annotations;
 
 import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ImmutableSet;
 import com.squareup.javapoet.*;
 import org.corfudb.runtime.object.*;
 
@@ -11,7 +12,6 @@ import javax.lang.model.type.DeclaredType;
 import javax.lang.model.type.TypeKind;
 import javax.lang.model.type.TypeMirror;
 import javax.lang.model.util.Elements;
-import javax.lang.model.util.Types;
 import javax.tools.Diagnostic;
 import java.io.IOException;
 import java.lang.reflect.Field;
@@ -31,7 +31,6 @@ import java.util.stream.IntStream;
 @SupportedAnnotationTypes("org.corfudb.annotations.*")
 public class ObjectAnnotationProcessor extends AbstractProcessor {
 
-    private Types typeUtils;
     private Elements elementUtils;
     private Filer filer;
     private Messager messager;
@@ -56,7 +55,6 @@ public class ObjectAnnotationProcessor extends AbstractProcessor {
     @Override
     public synchronized void init(ProcessingEnvironment processingEnv) {
         super.init(processingEnv);
-        typeUtils = processingEnv.getTypeUtils();
         elementUtils = processingEnv.getElementUtils();
         filer = processingEnv.getFiler();
         messager = processingEnv.getMessager();
@@ -98,6 +96,11 @@ public class ObjectAnnotationProcessor extends AbstractProcessor {
                         + classElement.getSimpleName() + " with IOException");
             }
         }
+        // deal with any inner classes
+        classElement.getEnclosedElements().stream()
+                .filter(x -> x instanceof TypeElement)
+                .map(x -> (TypeElement) x)
+                .forEach(this::processClass);
     }
 
     /** Return a SMR function name, extracting it from the annotations if available.
@@ -116,19 +119,19 @@ public class ObjectAnnotationProcessor extends AbstractProcessor {
     /** Class to hold data about SMR Methods. */
     class SMRMethodInfo {
         /** The method itself. */
-        ExecutableElement method;
+        final ExecutableElement method;
         /** The interface, if present, which provided the element. */
-        TypeElement interfaceOverride;
+        final TypeElement interfaceOverride;
         /** If the element should be excluded from instrumentation. */
-        boolean doNotAdd = false;
+        final boolean doNotAdd;
         /** If the element has conflictParameter annotations. */
         final boolean hasConflictAnnotations;
+        /** If the element has a function to calculate conflict params. */
+        final String conflictFunction;
 
         public SMRMethodInfo(ExecutableElement method,
                              TypeElement interfaceOverride) {
-            this.method = method;
-            this.interfaceOverride = interfaceOverride;
-            this.hasConflictAnnotations = checkForConflictAnnotations(method);
+            this(method, interfaceOverride, false);
         }
 
         public SMRMethodInfo(ExecutableElement method,
@@ -138,6 +141,29 @@ public class ObjectAnnotationProcessor extends AbstractProcessor {
             this.interfaceOverride = interfaceOverride;
             this.doNotAdd = doNotAdd;
             this.hasConflictAnnotations = checkForConflictAnnotations(method);
+
+
+            Accessor accessor = method.getAnnotation(Accessor.class);
+            MutatorAccessor mutatorAccessor = method.getAnnotation(MutatorAccessor.class);
+            Mutator mutator = method.getAnnotation(Mutator.class);
+
+            // Check if there is a conflictFunction
+            if (accessor != null && !accessor.conflictParameterFunction().equals("")) {
+                conflictFunction = accessor.conflictParameterFunction();
+            }else if (mutator != null && !mutator.conflictParameterFunction().equals("")) {
+                conflictFunction = mutator.conflictParameterFunction();
+            }
+            else if (mutatorAccessor != null && !mutatorAccessor.conflictParameterFunction().equals("")) {
+                conflictFunction = mutatorAccessor.conflictParameterFunction();
+            } else {
+                conflictFunction = null;
+            }
+
+            if (conflictFunction != null && hasConflictAnnotations) {
+                messager.printMessage(Diagnostic.Kind.ERROR, "Method " + method.getSimpleName() +
+                " cannot have both conflict annotations and conflict function '" + conflictFunction + "'");
+
+            }
         }
 
         /** Return whether the given method has conflict annotations.
@@ -162,8 +188,12 @@ public class ObjectAnnotationProcessor extends AbstractProcessor {
         // Extract the package name for the class. We'll need this to generate the proxy file.
         String packageName = elementUtils.getPackageOf(classElement).toString();
         // Calculate the name of the proxy, which appends $CORFUSMR to the class name.
-        ClassName proxyName = ClassName.bestGuess(classElement.getSimpleName().toString()
-                + ICorfuSMR.CORFUSMR_SUFFIX);
+        ClassName proxyName = classElement.getNestingKind() == NestingKind.TOP_LEVEL ?
+                // Top level classes can just use the name
+                ClassName.bestGuess(classElement.getSimpleName() + ICorfuSMR.CORFUSMR_SUFFIX) :
+                // Otherwise we need to include the enclosing element as well.
+                ClassName.bestGuess(classElement.getEnclosingElement().getSimpleName()
+                        + "$" + classElement.getSimpleName() + ICorfuSMR.CORFUSMR_SUFFIX);
         // Also get the class name of the original class.
         TypeName originalName = ParameterizedTypeName.get(classElement.asType());
 
@@ -332,6 +362,29 @@ public class ObjectAnnotationProcessor extends AbstractProcessor {
         methodSet.removeIf(x -> x.method.getSimpleName()
                 .toString().endsWith(ICorfuSMR.CORFUSMR_SUFFIX));
 
+        // Verify that all methods that require an up call have specified as annotated name
+        checkAnnotatedNames(methodSet);
+
+        // Gather methods that require upcalls
+        Set<SMRMethodInfo> upCalls = methodSet.stream()
+                .filter(x -> ((x.method.getAnnotation(Mutator.class) != null)
+                        && !x.method.getAnnotation(Mutator.class).noUpcall())
+                        || ((x.method.getAnnotation(MutatorAccessor.class) != null)
+                        && !x.method.getAnnotation(MutatorAccessor.class).noUpcall()))
+                .collect(Collectors.toCollection(HashSet::new));
+
+        checkOverloadConflicts(upCalls);
+
+        // Gather methods that reference upcall methods (i.e. mutators that require no upcalls)
+        Set<SMRMethodInfo> noUpcalls = methodSet.stream()
+                .filter(x -> ((x.method.getAnnotation(Mutator.class) != null)
+                        && x.method.getAnnotation(Mutator.class).noUpcall())
+                        || ((x.method.getAnnotation(MutatorAccessor.class) != null)
+                        && x.method.getAnnotation(MutatorAccessor.class).noUpcall()))
+                .collect(Collectors.toCollection(HashSet::new));
+
+        verifyNoUpCallReference(noUpcalls, upCalls);
+
         // Generate wrapper classes.
         methodSet.stream()
                 .filter(x -> !x.doNotAdd)
@@ -361,8 +414,16 @@ public class ObjectAnnotationProcessor extends AbstractProcessor {
                     }
 
                     // If there is conflict information, calculate the conflict set
+                    boolean hasConflictData = false;
                     final String conflictField = "conflictField" + CORFUSMR_FIELD;
-                    if (m.hasConflictAnnotations) {
+
+
+                    if (m.conflictFunction != null) {
+                        hasConflictData = true;
+                        addConflictFieldFromFunctionToMethod(ms, conflictField, m.conflictFunction, smrMethod);
+                    }
+                    else if (m.hasConflictAnnotations) {
+                        hasConflictData = true;
                         addConflictFieldToMethod(ms, conflictField, smrMethod);
                     }
 
@@ -370,9 +431,13 @@ public class ObjectAnnotationProcessor extends AbstractProcessor {
                     if (mutator != null || mutatorAccessor != null) {
                         ms.addStatement(
                                 (mutatorAccessor != null ? "long address" + CORFUSMR_FIELD + " = " : "") +
-                                "proxy" + CORFUSMR_FIELD + ".logUpdate($S,$L$L$L)",
+                                "proxy" + CORFUSMR_FIELD + ".logUpdate($S,$L,$L$L$L)",
                                 getSMRFunctionName(smrMethod),
-                                m.hasConflictAnnotations ? conflictField : "null",
+                                // Don't need upcall result for mutators
+                                mutator != null ? "false" :
+                                // or mutatorAccessors which return void.
+                                smrMethod.getReturnType().getKind().equals(TypeKind.VOID) ? "false" : "true",
+                                hasConflictData ? conflictField : "null",
                                 smrMethod.getParameters().size() > 0 ? "," : "",
                                 smrMethod.getParameters().stream()
                                     .map(VariableElement::getSimpleName)
@@ -382,7 +447,7 @@ public class ObjectAnnotationProcessor extends AbstractProcessor {
 
                     // If an accessor (or not annotated), return the object by doing the underlying call.
                     if (mutatorAccessor != null) {
-                        // If the return to the mutatorAcessor is void, we don't need
+                        // If the return to the mutatorAccessor is void, we don't need
                         // to do anything...
                         if (!smrMethod.getReturnType().getKind().equals(TypeKind.VOID)) {
                             ms.addStatement("return (" +
@@ -460,6 +525,7 @@ public class ObjectAnnotationProcessor extends AbstractProcessor {
         addUpcallMap(typeSpecBuilder, originalName, interfacesToAdd, methodSet);
         addUndoRecordMap(typeSpecBuilder, originalName, interfacesToAdd, methodSet);
         addUndoMap(typeSpecBuilder, originalName, interfacesToAdd, methodSet);
+        addResetSet(typeSpecBuilder, originalName, interfacesToAdd, methodSet);
 
         typeSpecBuilder
                 .addSuperinterfaces(interfacesToAdd);
@@ -473,6 +539,114 @@ public class ObjectAnnotationProcessor extends AbstractProcessor {
                 .build();
 
         javaFile.writeTo(filer);
+    }
+
+    /*
+     * Verify that methods with a mutator annotation specify the name field
+     */
+    void checkAnnotatedNames(Set<SMRMethodInfo> methodSet) {
+
+        for(SMRMethodInfo smrMethodInfo : methodSet) {
+            if((smrMethodInfo.method.getAnnotation(Mutator.class) != null
+                    && smrMethodInfo.method.getAnnotation(Mutator.class).name().isEmpty())
+                    || (smrMethodInfo.method.getAnnotation(MutatorAccessor.class) != null
+                    && smrMethodInfo.method.getAnnotation(MutatorAccessor.class).name().isEmpty())){
+                messager.printMessage(Diagnostic.Kind.ERROR, "Method " + smrMethodInfo.method.getSimpleName()
+                        + " must specify a name in its annotation name field");
+            }
+        }
+    }
+
+    String getAnnotationNameField(ExecutableElement method) {
+        String name = "";
+
+        if(method.getAnnotation(Mutator.class) != null) {
+            name = method.getAnnotation(Mutator.class).name();
+        } else if (method.getAnnotation(MutatorAccessor.class) != null) {
+            name = method.getAnnotation(MutatorAccessor.class).name();
+        }
+
+        return name;
+    }
+
+    /*
+     * Verify that the no upcall methods reference valid upcall methods
+     */
+    void verifyNoUpCallReference(Set<SMRMethodInfo> noUpcalls, Set<SMRMethodInfo> upCalls) {
+
+        Set<String> upCallMethodNames = upCalls.stream()
+                .map(x -> getAnnotationNameField(x.method))
+                .collect(Collectors.toCollection(HashSet::new));
+
+        for(SMRMethodInfo smrMethodInfo : noUpcalls) {
+            String methodName = getAnnotationNameField(smrMethodInfo.method);
+
+            if(!upCallMethodNames.contains(methodName)){
+                messager.printMessage(Diagnostic.Kind.ERROR,
+                        "Error " + smrMethodInfo.method.toString() +" referencing unknown smr method ");
+            }
+        }
+    }
+
+    /**
+     * Verify that no two methods have the same annotation name
+     * @param possibleConflictMethods Methods that are mutators and require upcalls
+     */
+    void checkOverloadConflicts(Set<SMRMethodInfo> possibleConflictMethods) {
+        Set<SMRMethodInfo> allMethods = new HashSet<>(possibleConflictMethods);
+
+        for(SMRMethodInfo smrMethodInfo : possibleConflictMethods) {
+            Set<SMRMethodInfo> setDiff = new HashSet<>(allMethods);
+            setDiff.remove(smrMethodInfo);
+
+            String baseMethodName = getAnnotationNameField(smrMethodInfo.method);
+
+            for(SMRMethodInfo smrMethodInfo2 : setDiff) {
+                String methodName = getAnnotationNameField(smrMethodInfo2.method);
+
+                if(baseMethodName.equals(methodName)){
+                    messager.printMessage(Diagnostic.Kind.ERROR,
+                            "Error overloading with annotation name "
+                                    + smrMethodInfo.method.toString() + " and " + smrMethodInfo2.method.toString());
+                    
+                }
+            }
+        }
+    }
+
+    /** Add the reset set and the getter for the set.
+     *
+     * @param typeSpecBuilder   The typespec builder to add the reset set to
+     * @param originalName      The name of the original base type (without $CORFUSMR)
+     * @param interfacesToAdd   A list of interfaces to add for instrumentation.
+     * @param methodSet         The set of methods to add for instrumentation.
+     */
+    private void addResetSet(TypeSpec.Builder typeSpecBuilder, TypeName originalName,
+                             Set<TypeName> interfacesToAdd, Set<SMRMethodInfo> methodSet) {
+        // Generate the initializer for the reset set.
+        String resetString = methodSet.stream()
+                .filter(x -> x.method.getAnnotation(Mutator.class) != null
+                        && x.method.getAnnotation(Mutator.class).reset()||
+                        x.method.getAnnotation(MutatorAccessor.class) != null
+                                && x.method.getAnnotation(MutatorAccessor.class).reset())
+                .map(x -> "\n.add(\"" + getSMRFunctionName(x.method) + "\")")
+                .collect(Collectors.joining());
+
+        FieldSpec resetSet = FieldSpec.builder(ParameterizedTypeName.get(ClassName.get(Set.class),
+                ClassName.get(String.class)), "resetSet" + CORFUSMR_FIELD, Modifier.FINAL, Modifier.PUBLIC)
+                .initializer("new $T()$L.build()",
+                        ParameterizedTypeName.get(ClassName.get(ImmutableSet.Builder.class),
+                                ClassName.get(String.class)), resetString)
+                .build();
+
+        typeSpecBuilder.addField(resetSet);
+        typeSpecBuilder.addMethod(MethodSpec.methodBuilder("getCorfuResetSet")
+                .addModifiers(Modifier.PUBLIC)
+                .returns(ParameterizedTypeName.get(ClassName.get(Set.class),
+                        ClassName.get(String.class)))
+                .addStatement("return $L", "resetSet" + CORFUSMR_FIELD)
+                .build());
+
     }
 
     private void addUpcallMap(TypeSpec.Builder typeSpecBuilder, TypeName originalName,
@@ -704,6 +878,22 @@ public class ObjectAnnotationProcessor extends AbstractProcessor {
                         .stream()
                         .filter(y -> y.getAnnotation(ConflictParameter.class)
                                 != null)
+                        .map(y -> y.getSimpleName())
+                        .collect(Collectors.joining(", ")));
+    }
+
+    /** Add a conflict field to the method.
+     *
+     * @param ms                The builder to add the field to.
+     * @param conflictField     The name of the field to add
+     * @param functionName      The function to call to obtain the parameters.
+     * @param smrMethod         The method element.
+     */
+    public void addConflictFieldFromFunctionToMethod(MethodSpec.Builder ms, String conflictField, String functionName,
+                                                     ExecutableElement smrMethod) {
+        ms.addStatement("$T $L = $L($L)", Object[].class, conflictField, functionName,
+                smrMethod.getParameters()
+                        .stream()
                         .map(y -> y.getSimpleName())
                         .collect(Collectors.joining(", ")));
     }

@@ -20,7 +20,12 @@ import java.lang.invoke.MethodHandles;
 
 import java.util.Collections;
 import java.util.Map;
-import java.util.concurrent.*;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.Future;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Instantiates and performs failure detection and handling asynchronously.
@@ -42,8 +47,10 @@ public class ManagementServer extends AbstractServer {
     private final Map<String, Object> opts;
     private final ServerContext serverContext;
 
-    private static final String PREFIX_LAYOUT = "M_LAYOUT";
-    private static final String KEY_LAYOUT = "M_CURRENT";
+    private static final String PREFIX_MANAGEMENT = "MANAGEMENT";
+    private static final String KEY_LAYOUT = "LAYOUT";
+
+    private static final String metricsPrefix = "corfu.server.management-server.";
 
     private CorfuRuntime corfuRuntime;
     /**
@@ -68,6 +75,10 @@ public class ManagementServer extends AbstractServer {
      */
     private boolean startFailureHandler = false;
     /**
+     * Failure Handler Dispatcher to launch configuration changes or recovery.
+     */
+    FailureHandlerDispatcher failureHandlerDispatcher;
+    /**
      * Interval in executing the failure detection policy.
      * In milliseconds.
      */
@@ -82,6 +93,7 @@ public class ManagementServer extends AbstractServer {
      * Future for periodic failure detection task.
      */
     private Future failureDetectorFuture = null;
+    private AtomicBoolean recovered = new AtomicBoolean(false);
 
     public ManagementServer(ServerContext serverContext) {
 
@@ -89,6 +101,12 @@ public class ManagementServer extends AbstractServer {
         this.serverContext = serverContext;
 
         bootstrapEndpoint = (opts.get("--management-server")!=null) ? opts.get("--management-server").toString() : null;
+
+        safeUpdateLayout(getCurrentLayout());
+        // If no state was preserved, there is no layout to recover.
+        if (latestLayout == null) {
+            recovered.set(true);
+        }
 
         if((Boolean) opts.get("--single")) {
             String localAddress = opts.get("--address") + ":" + opts.get("<port>");
@@ -110,12 +128,11 @@ public class ManagementServer extends AbstractServer {
             );
 
             safeUpdateLayout(singleLayout);
-        } else {
-            safeUpdateLayout(getCurrentLayout());
         }
 
         this.failureDetectorPolicy = serverContext.getFailureDetectorPolicy();
         this.failureHandlerPolicy = serverContext.getFailureHandlerPolicy();
+        this.failureHandlerDispatcher = new FailureHandlerDispatcher();
         this.failureDetectorService = Executors.newScheduledThreadPool(
                 2,
                 new ThreadFactoryBuilder()
@@ -132,6 +149,15 @@ public class ManagementServer extends AbstractServer {
                     TimeUnit.MILLISECONDS);
         } catch (RejectedExecutionException err) {
             log.error("Error scheduling failure detection task, {}", err);
+        }
+    }
+
+    private void recover() {
+        try {
+            failureHandlerDispatcher.recoverCluster((Layout) latestLayout.clone(), getCorfuRuntime());
+            safeUpdateLayout(corfuRuntime.getLayoutView().getLayout());
+        } catch (CloneNotSupportedException e) {
+            log.error("Failure Handler could not clone layout: {}", e);
         }
     }
 
@@ -164,7 +190,7 @@ public class ManagementServer extends AbstractServer {
      * @param layout Layout to be persisted
      */
     private void setCurrentLayout(Layout layout) {
-        serverContext.getDataStore().put(Layout.class, PREFIX_LAYOUT, KEY_LAYOUT, layout);
+        serverContext.getDataStore().put(Layout.class, PREFIX_MANAGEMENT, KEY_LAYOUT, layout);
     }
 
     /**
@@ -173,7 +199,7 @@ public class ManagementServer extends AbstractServer {
      * @return The last persisted layout
      */
     private Layout getCurrentLayout() {
-        return serverContext.getDataStore().get(Layout.class, PREFIX_LAYOUT, KEY_LAYOUT);
+        return serverContext.getDataStore().get(Layout.class, PREFIX_MANAGEMENT, KEY_LAYOUT);
     }
 
     boolean checkBootstrap(CorfuMsg msg, ChannelHandlerContext ctx, IServerRouter r) {
@@ -193,8 +219,9 @@ public class ManagementServer extends AbstractServer {
      * @param ctx
      * @param r
      */
-    @ServerHandler(type = CorfuMsgType.MANAGEMENT_BOOTSTRAP_REQUEST)
-    public synchronized void handleManagementBootstrap(CorfuPayloadMsg<Layout> msg, ChannelHandlerContext ctx, IServerRouter r) {
+    @ServerHandler(type = CorfuMsgType.MANAGEMENT_BOOTSTRAP_REQUEST, opTimer = metricsPrefix + "bootstrap-request")
+    public synchronized void handleManagementBootstrap(CorfuPayloadMsg<Layout> msg, ChannelHandlerContext ctx, IServerRouter r,
+                                                       boolean isMetricsEnabled) {
         if (latestLayout != null) {
             // We are already bootstrapped, bootstrap again is not allowed.
             log.warn("Got a request to bootstrap a server which is already bootstrapped, rejecting!");
@@ -214,8 +241,9 @@ public class ManagementServer extends AbstractServer {
      * @param ctx
      * @param r
      */
-    @ServerHandler(type = CorfuMsgType.MANAGEMENT_START_FAILURE_HANDLER)
-    public synchronized void initiateFailureHandler(CorfuMsg msg, ChannelHandlerContext ctx, IServerRouter r) {
+    @ServerHandler(type = CorfuMsgType.MANAGEMENT_START_FAILURE_HANDLER, opTimer = metricsPrefix + "start-failure-handler")
+    public synchronized void initiateFailureHandler(CorfuMsg msg, ChannelHandlerContext ctx, IServerRouter r,
+                                                    boolean isMetricsEnabled) {
         if (isShutdown()) {
             log.warn("Management Server received {} but is shutdown.", msg.getMsgType().toString());
             r.sendResponse(ctx, msg, new CorfuMsg(CorfuMsgType.NACK));
@@ -241,8 +269,9 @@ public class ManagementServer extends AbstractServer {
      * @param ctx
      * @param r
      */
-    @ServerHandler(type = CorfuMsgType.MANAGEMENT_FAILURE_DETECTED)
-    public synchronized void handleFailureDetectedMsg(CorfuPayloadMsg<FailureDetectorMsg> msg, ChannelHandlerContext ctx, IServerRouter r) {
+    @ServerHandler(type = CorfuMsgType.MANAGEMENT_FAILURE_DETECTED, opTimer = metricsPrefix + "failure-detected")
+    public synchronized void handleFailureDetectedMsg(CorfuPayloadMsg<FailureDetectorMsg> msg, ChannelHandlerContext ctx, IServerRouter r,
+                                                      boolean isMetricsEnabled) {
         if (isShutdown()) {
             log.warn("Management Server received {} but is shutdown.", msg.getMsgType().toString());
             r.sendResponse(ctx, msg, new CorfuMsg(CorfuMsgType.NACK));
@@ -252,9 +281,13 @@ public class ManagementServer extends AbstractServer {
         if (!checkBootstrap(msg, ctx, r)) { return; }
 
         log.info("Received Failures : {}", msg.getPayload().getNodes());
-        r.sendResponse(ctx, msg, new CorfuMsg(CorfuMsgType.ACK));
-        FailureHandlerDispatcher failureHandlerDispatcher = new FailureHandlerDispatcher();
-        failureHandlerDispatcher.dispatchHandler(failureHandlerPolicy, latestLayout, getCorfuRuntime(), msg.getPayload().getNodes().keySet());
+        try {
+            failureHandlerDispatcher.dispatchHandler(failureHandlerPolicy, (Layout) latestLayout.clone(), getCorfuRuntime(), msg.getPayload().getNodes());
+            r.sendResponse(ctx, msg, new CorfuMsg(CorfuMsgType.ACK));
+        } catch (CloneNotSupportedException e) {
+            log.error("Failure Handler could not clone layout: {}", e);
+            r.sendResponse(ctx, msg, new CorfuMsg(CorfuMsgType.NACK));
+        }
     }
 
     /**
@@ -266,8 +299,9 @@ public class ManagementServer extends AbstractServer {
      * @param ctx
      * @param r
      */
-    @ServerHandler(type = CorfuMsgType.HEARTBEAT_REQUEST)
-    public void handleHearbeatRequest(CorfuMsg msg, ChannelHandlerContext ctx, IServerRouter r) {
+    @ServerHandler(type = CorfuMsgType.HEARTBEAT_REQUEST, opTimer = metricsPrefix + "heartbeat-request")
+    public void handleHearbeatRequest(CorfuMsg msg, ChannelHandlerContext ctx, IServerRouter r,
+                                      boolean isMetricsEnabled) {
         // Currently builds a default instance of the model.
         // TODO: Collect metrics from Layout, Sequencer and LogUnit Servers.
         NodeMetrics nodeMetrics = NodeMetrics.getDefaultInstance();
@@ -322,6 +356,8 @@ public class ManagementServer extends AbstractServer {
             log.warn("Management Server waiting to be bootstrapped");
             return;
         }
+        // Recover if flag is false
+        if (!recovered.getAndSet(true)) recover();
         if (failureDetectorFuture == null || failureDetectorFuture.isDone()) {
             failureDetectorFuture = failureDetectorService.submit(this::failureDetectorTask);
         } else {
@@ -357,22 +393,69 @@ public class ManagementServer extends AbstractServer {
         failureDetectorPolicy.executePolicy(latestLayout, corfuRuntime);
 
         // Get the server status from the policy and check for failures.
-        Map map = failureDetectorPolicy.getServerStatus();
-        if (!map.isEmpty()) {
-            log.info("Failures detected. Failed nodes : {}", map.toString());
-            // If map not empty, failures present. Trigger handler.
-            // Check if handler has been initiated.
-            if (!startFailureHandler) {
-                log.warn("Failure Handler not yet initiated .");
-                return;
+        PollReport pollReport = failureDetectorPolicy.getServerStatus();
+
+        // Analyze the poll report and trigger failure handler if needed.
+        analyzePollReportAndTriggerHandler(pollReport);
+
+    }
+
+    /**
+     * Analyzes the poll report and triggers the failure handler if status change
+     * of node detected.
+     * <p>
+     * @param pollReport Poll report obtained from failure detection policy.
+     */
+    private void analyzePollReportAndTriggerHandler(PollReport pollReport) {
+
+        // Check if handler has been initiated.
+        if (!startFailureHandler) {
+            log.debug("Failure Handler not yet initiated: {}", pollReport.toString());
+            return;
+        }
+
+        final ManagementClient localManagementClient = corfuRuntime.getRouter(getLocalEndpoint()).getClient(ManagementClient.class);
+
+        try {
+            if (!pollReport.getIsFailurePresent()) {
+                // CASE 1:
+                // No Failures detected by polling policy.
+                // We can check if we have unresponsive servers marked in the layout and
+                // un-mark them as they respond to polling now.
+                if (!latestLayout.getUnresponsiveServers().isEmpty()) {
+                    log.info("Received response from unresponsive server");
+                    localManagementClient.handleFailure(pollReport.getFailingNodes()).get();
+                    return;
+                }
+                log.debug("No failures present.");
+
+            } else if (!pollReport.getFailingNodes().isEmpty() && !latestLayout.getUnresponsiveServers().isEmpty()) {
+                // CASE 2:
+                // Failures detected - unresponsive servers.
+                // We check if these servers are the same set of servers which are marked as
+                // unresponsive in the layout. If yes take no action. Else trigger handler.
+                log.info("Failures detected. Failed nodes : {}", pollReport.toString());
+                // Check if this failure has already been recognized.
+                //TODO: Does not handle the un-marking case where markedSet is a superset of pollFailures.
+                for (String failedServer : pollReport.getFailingNodes()) {
+                    if (!latestLayout.getUnresponsiveServers().contains(failedServer)) {
+                        localManagementClient.handleFailure(pollReport.getFailingNodes()).get();
+                        return;
+                    }
+                }
+                log.debug("Failure already taken care of.");
+
+            } else {
+                // CASE 3:
+                // Failures detected but not marked in the layout or
+                // some servers have been partially sealed to new epoch or stuck on
+                // the previous epoch.
+                localManagementClient.handleFailure(pollReport.getFailingNodes()).get();
+                // TODO: Only re-sealing needed if server stuck on a previous epoch.
             }
-            try {
-                corfuRuntime.getRouter(getLocalEndpoint()).getClient(ManagementClient.class).handleFailure(map);
-            } catch (Exception e) {
-                log.error("Exception invoking failure handler : {}", e);
-            }
-        } else {
-            log.debug("No failures present.");
+
+        } catch (Exception e) {
+            log.error("Exception invoking failure handler : {}", e);
         }
     }
 

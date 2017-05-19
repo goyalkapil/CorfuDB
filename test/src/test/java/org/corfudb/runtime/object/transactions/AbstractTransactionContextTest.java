@@ -1,7 +1,6 @@
 package org.corfudb.runtime.object.transactions;
 
 import com.google.common.reflect.TypeToken;
-import org.corfudb.protocols.wireprotocol.DataType;
 import org.corfudb.protocols.wireprotocol.ILogData;
 import org.corfudb.runtime.collections.ISMRMap;
 import org.corfudb.runtime.collections.SMRMap;
@@ -17,7 +16,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 /**
  * Created by mwei on 11/21/16.
  */
-public abstract class AbstractTransactionContextTest extends AbstractObjectTest {
+public abstract class AbstractTransactionContextTest extends AbstractTransactionsTest {
 
     protected ISMRMap<String, String> testMap;
 
@@ -93,9 +92,10 @@ public abstract class AbstractTransactionContextTest extends AbstractObjectTest 
         ILogData ld =
                 getRuntime()
                         .getAddressSpaceView()
-                        .read(0);
-        assertThat(ld.getType())
-                .isEqualTo(DataType.EMPTY);
+                        .peek(0);
+        assertThat(ld)
+                .isNull();
+
         assertThat(result)
                 .isEqualTo(AbstractTransactionalContext.NOWRITE_ADDRESS);
     }

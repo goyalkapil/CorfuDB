@@ -1,32 +1,22 @@
 package org.corfudb.runtime.object;
 
-import lombok.Getter;
-import org.corfudb.runtime.CorfuRuntime;
-import org.corfudb.runtime.view.AbstractViewTest;
 import org.junit.Test;
-
-import java.util.TreeMap;
-import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
  * Created by dmalkhi on 12/4/16.
  */
-public class CorfuSMRObjectConcurrencyTest extends AbstractViewTest {
-    @Getter
-    final String defaultConfigurationString = getDefaultEndpoint();
-
+public class CorfuSMRObjectConcurrencyTest extends AbstractObjectTest {
     @Test
     public void testCorfuSharedCounterConcurrentReads() throws Exception {
         getDefaultRuntime();
 
         final int COUNTER_INITIAL = 55;
-        CorfuSharedCounter sharedCounter = getRuntime().getObjectsView().
-                build().
-                setStreamName("test")
-                .setType(CorfuSharedCounter.class)
-                .open();
+
+        CorfuSharedCounter sharedCounter = (CorfuSharedCounter)
+                instantiateCorfuObject(CorfuSharedCounter.class, "test");
+
         sharedCounter.setValue(COUNTER_INITIAL);
 
         int concurrency = PARAMETERS.CONCURRENCY_SOME * 2;

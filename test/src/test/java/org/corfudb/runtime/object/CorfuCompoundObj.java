@@ -1,6 +1,5 @@
 package org.corfudb.runtime.object;
 
-import jdk.nashorn.internal.objects.annotations.Constructor;
 import lombok.Getter;
 import lombok.Setter;
 import org.corfudb.annotations.Accessor;
@@ -23,7 +22,7 @@ public class CorfuCompoundObj {
     Inner user;
     int ID;
 
-    @Mutator
+    @Mutator(name = "set")
     public void set(Inner in, int id) {
         this.user = in;
         this.ID = id;

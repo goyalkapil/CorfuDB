@@ -1,7 +1,7 @@
 package org.corfudb.infrastructure;
 
 import io.netty.buffer.ByteBuf;
-import io.netty.buffer.ByteBufAllocator;
+import io.netty.buffer.Unpooled;
 import io.netty.channel.ChannelHandlerContext;
 import lombok.Getter;
 import lombok.Setter;
@@ -13,13 +13,10 @@ import org.corfudb.runtime.clients.TestChannelContext;
 import org.corfudb.runtime.clients.TestRule;
 
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
-
-import static org.assertj.core.api.Assertions.assertThat;
 
 /**
  * Created by mwei on 12/13/15.
@@ -41,11 +38,12 @@ public class TestServerRouter implements IServerRouter {
     @Setter
     long serverEpoch;
 
+    @Getter
+    int port = 0;
+
     public TestServerRouter() {
         reset();
     }
-    @Getter
-    int port;
 
     public TestServerRouter(int port) {
         reset();
@@ -124,11 +122,15 @@ public class TestServerRouter implements IServerRouter {
 
     public void sendServerMessage(CorfuMsg msg, ChannelHandlerContext ctx) {
         AbstractServer as = handlerMap.get(msg.getMsgType());
-        if (as != null) {
-            as.handleMessage(msg, ctx, this);
-        }
-        else {
-            log.trace("Unregistered message of type {} sent to router", msg.getMsgType());
+        if (validateEpoch(msg, ctx)) {
+            if (as != null) {
+                as.handleMessage(msg, ctx, this);
+            }
+            else {
+                log.trace("Unregistered message of type {} sent to router", msg.getMsgType());
+            }
+        } else {
+            log.trace("Message with wrong epoch {}, expected {}", msg.getEpoch(), serverEpoch);
         }
     }
 
@@ -142,7 +144,7 @@ public class TestServerRouter implements IServerRouter {
 
     public CorfuMsg simulateSerialization(CorfuMsg message) {
         /* simulate serialization/deserialization */
-        ByteBuf oBuf = ByteBufAllocator.DEFAULT.buffer();
+        ByteBuf oBuf = Unpooled.buffer();
         //Class<? extends CorfuMsg> type = message.getMsgType().messageType;
         //extra assert needed to simulate real Netty behavior
         //assertThat(message.getClass().getSimpleName()).isEqualTo(type.getSimpleName());

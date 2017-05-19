@@ -4,7 +4,6 @@ import com.google.common.reflect.TypeToken;
 import org.corfudb.runtime.collections.SMRMap;
 import org.corfudb.runtime.object.transactions.TransactionalContext;
 import org.corfudb.runtime.view.AbstractViewTest;
-import org.corfudb.runtime.view.stream.IStreamView;
 import org.junit.Test;
 
 import java.util.Map;
@@ -26,7 +25,6 @@ public class CompileProxyTest extends AbstractViewTest {
         Map<String, String> map = getDefaultRuntime()
                                     .getObjectsView().build()
                                     .setStreamName("my stream")
-                                    .setUseCompiledClass(true)
                                     .setTypeToken(new TypeToken<SMRMap<String,String>>() {})
                                     .open();
 
@@ -46,7 +44,6 @@ public class CompileProxyTest extends AbstractViewTest {
         CorfuSharedCounter sharedCounter = getDefaultRuntime()
                 .getObjectsView().build()
                 .setStreamName("my stream")
-                .setUseCompiledClass(true)
                 .setTypeToken(new TypeToken<CorfuSharedCounter>() {
                 })
                 .open();
@@ -69,7 +66,6 @@ public class CompileProxyTest extends AbstractViewTest {
         CorfuSharedCounter sharedCounter = getDefaultRuntime()
                 .getObjectsView().build()
                 .setStreamName("my stream")
-                .setUseCompiledClass(true)
                 .setTypeToken(new TypeToken<CorfuSharedCounter>() {
                 })
                 .open();
@@ -90,7 +86,7 @@ public class CompileProxyTest extends AbstractViewTest {
         // track the raw stream updates caused by the execution so far
         ICorfuSMR<CorfuSharedCounter> compiledSharedCounter = (ICorfuSMR<CorfuSharedCounter>) sharedCounter;
         ICorfuSMRProxyInternal<CorfuSharedCounter> proxy_CORFUSMR = (ICorfuSMRProxyInternal<CorfuSharedCounter>) compiledSharedCounter.getCorfuSMRProxy();
-        IStreamView objStream = proxy_CORFUSMR.getUnderlyingObject().getStreamViewUnsafe();
+        //IStreamView objStream = proxy_CORFUSMR.getUnderlyingObject().getStreamViewUnsafe();
 
         int beforeSync, afterSync;
 
@@ -100,7 +96,8 @@ public class CompileProxyTest extends AbstractViewTest {
 
         // sync with the stream entry by entry
         for (int timestamp = 1; timestamp <= concurrency; timestamp++) {
-            proxy_CORFUSMR.syncObjectUnsafe(proxy_CORFUSMR.getUnderlyingObject(), timestamp);
+            proxy_CORFUSMR.getUnderlyingObject()
+                    .syncObjectUnsafe(timestamp);
             assertThat((afterSync = proxy_CORFUSMR.getUnderlyingObject().object.getValue()))
                     .isBetween(0, concurrency);
             assertThat(beforeSync)
@@ -125,7 +122,6 @@ public class CompileProxyTest extends AbstractViewTest {
     CorfuSharedCounter sharedCounter = getDefaultRuntime()
             .getObjectsView().build()
             .setStreamName("my stream")
-            .setUseCompiledClass(true)
             .setTypeToken(new TypeToken<CorfuSharedCounter>() {
             })
             .open();
@@ -163,7 +159,6 @@ public class CompileProxyTest extends AbstractViewTest {
         CorfuSharedCounter sharedCounter = getDefaultRuntime()
                 .getObjectsView().build()
                 .setStreamName("my stream")
-                .setUseCompiledClass(true)
                 .setTypeToken(new TypeToken<CorfuSharedCounter>() {
                 })
                 .open();
@@ -207,14 +202,13 @@ public class CompileProxyTest extends AbstractViewTest {
         CorfuSharedCounter sharedCounter = getDefaultRuntime()
                 .getObjectsView().build()
                 .setStreamName("my stream")
-                .setUseCompiledClass(true)
                 .setTypeToken(new TypeToken<CorfuSharedCounter>() {
                 })
                 .open();
 
         ICorfuSMR<CorfuSharedCounter> compiledSharedCounter = (ICorfuSMR<CorfuSharedCounter>)  sharedCounter;
         ICorfuSMRProxyInternal<CorfuSharedCounter> proxy_CORFUSMR = (ICorfuSMRProxyInternal<CorfuSharedCounter>) compiledSharedCounter.getCorfuSMRProxy();
-        IStreamView objStream = proxy_CORFUSMR.getUnderlyingObject().getStreamViewUnsafe();
+      //  IStreamView objStream = proxy_CORFUSMR.getUnderlyingObject().getStreamViewUnsafe();
 
         int numTasks = PARAMETERS.NUM_ITERATIONS_LOW;
         Random r = new Random(PARAMETERS.SEED);
@@ -275,7 +269,6 @@ public class CompileProxyTest extends AbstractViewTest {
         Map<String, String> map = getDefaultRuntime()
                 .getObjectsView().build()
                 .setStreamName("my stream")
-                .setUseCompiledClass(true)
                 .setTypeToken(new TypeToken<SMRMap<String, String>>() {
                 })
                 .open();
@@ -312,7 +305,6 @@ public class CompileProxyTest extends AbstractViewTest {
         CorfuCompoundObj sharedCorfuCompound = getDefaultRuntime()
                 .getObjectsView().build()
                 .setStreamName("my stream")
-                .setUseCompiledClass(true)
                 .setTypeToken(new TypeToken<CorfuCompoundObj>() {
                 })
                 .open();
@@ -340,7 +332,6 @@ public class CompileProxyTest extends AbstractViewTest {
         CorfuCompoundObj sharedCorfuCompound = getDefaultRuntime()
                 .getObjectsView().build()
                 .setStreamName("my stream")
-                .setUseCompiledClass(true)
                 .setTypeToken(new TypeToken<CorfuCompoundObj>() {
                 })
                 .open();
@@ -384,7 +375,6 @@ public class CompileProxyTest extends AbstractViewTest {
         CorfuCompoundObj sharedCorfuCompound = getDefaultRuntime()
                 .getObjectsView().build()
                 .setStreamName("my stream")
-                .setUseCompiledClass(true)
                 .setTypeToken(new TypeToken<CorfuCompoundObj>() {
                 })
                 .open();
@@ -392,7 +382,7 @@ public class CompileProxyTest extends AbstractViewTest {
         // for tracking raw stream status
         ICorfuSMR<CorfuCompoundObj> compiledCorfuCompound = (ICorfuSMR<CorfuCompoundObj>) sharedCorfuCompound;
         ICorfuSMRProxyInternal<CorfuCompoundObj> proxy_CORFUSMR = (ICorfuSMRProxyInternal<CorfuCompoundObj>) compiledCorfuCompound.getCorfuSMRProxy();
-        IStreamView objStream = proxy_CORFUSMR.getUnderlyingObject().getStreamViewUnsafe();
+       // IStreamView objStream = proxy_CORFUSMR.getUnderlyingObject().getStreamViewUnsafe();
 
         // initialization
         sharedCorfuCompound.set(sharedCorfuCompound.new Inner("E" + 0, "F" + 0), 0);
@@ -425,50 +415,6 @@ public class CompileProxyTest extends AbstractViewTest {
         assertThat(sharedCorfuCompound.getUser().getLastName())
                 .startsWith("D");
 
-    }
-
-    /** Checks that the fine-grained conflict set is correctly produced
-     * by the annotation framework.
-     */
-    @Test
-    public void checkConflictParameters() {
-        ConflictParameterClass testObject = getDefaultRuntime()
-                .getObjectsView().build()
-                .setStreamName("my stream")
-                .setUseCompiledClass(true)
-                .setType(ConflictParameterClass.class)
-                .open();
-
-        final String TEST_0 = "0";
-        final String TEST_1 = "1";
-        final int TEST_2 = 2;
-        final int TEST_3 = 3;
-        final String TEST_4 = "4";
-        final String TEST_5 = "5";
-
-        getRuntime().getObjectsView().TXBegin();
-        // RS=TEST_0
-        testObject.accessorTest(TEST_0, TEST_1);
-        // WS=TEST_3
-        testObject.mutatorTest(TEST_2, TEST_3);
-        // WS,RS=TEST_4
-        testObject.mutatorAccessorTest(TEST_4, TEST_5);
-
-        // Assert that the conflict set contains TEST_1, TEST_4
-        assertThat(TransactionalContext.getCurrentContext()
-                .getReadSet().values().stream()
-                .flatMap(x -> x.stream())
-                .collect(Collectors.toList()))
-                .contains(Integer.valueOf(TEST_0.hashCode()), Integer.valueOf(TEST_4.hashCode()));
-
-        // in optimistic mode, assert that the conflict set does NOT contain TEST_2, TEST_4
-        assertThat(TransactionalContext.getCurrentContext()
-                .getReadSet().values().stream()
-                .flatMap(x -> x.stream())
-                .collect(Collectors.toList()))
-                .doesNotContain(Integer.valueOf(TEST_3), Integer.valueOf(TEST_4));
-
-        getRuntime().getObjectsView().TXAbort();
     }
 
 }

@@ -7,23 +7,28 @@ import lombok.extern.slf4j.Slf4j;
 import org.corfudb.infrastructure.log.LogAddress;
 import org.corfudb.infrastructure.log.StreamLog;
 import org.corfudb.protocols.wireprotocol.LogData;
+import org.corfudb.runtime.exceptions.DataOutrankedException;
 import org.corfudb.runtime.exceptions.OverwriteException;
 
 import javax.annotation.Nonnull;
 import java.util.LinkedList;
 import java.util.List;
-import java.util.concurrent.*;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
 
 /**
  * BatchWriter is a class that will intercept write-through calls to batch and
  * sync writes.
  */
 @Slf4j
-public class BatchWriter <K, V> implements CacheWriter<K, V>, AutoCloseable {
+public class BatchWriter<K, V> implements CacheWriter<K, V>, AutoCloseable {
 
     static final int BATCH_SIZE = 50;
     private StreamLog streamLog;
-    private BlockingQueue<WriteOperation> writeQueue;
+    private BlockingQueue<BatchWriterOperation> operationsQueue;
     final ExecutorService writerService = Executors.newSingleThreadExecutor(new ThreadFactoryBuilder()
             .setDaemon(false)
             .setNameFormat("LogUnit-Write-Processor-%d")
@@ -31,70 +36,76 @@ public class BatchWriter <K, V> implements CacheWriter<K, V>, AutoCloseable {
 
     public BatchWriter(StreamLog streamLog) {
         this.streamLog = streamLog;
-        writeQueue = new LinkedBlockingQueue<>();
+        operationsQueue = new LinkedBlockingQueue<>();
         writerService.submit(this::batchWriteProcessor);
     }
 
     @Override
     public void write(@Nonnull K key, @Nonnull V value) {
         try {
-            submitWrite((LogAddress) key, (LogData) value).get();
+            CompletableFuture<Void> cf = new CompletableFuture();
+            operationsQueue.add(new BatchWriterOperation(BatchWriterOperation.Type.WRITE,
+                    (LogAddress) key, (LogData) value, cf));
+            cf.get();
         } catch (Exception e) {
             log.trace("Write Exception {}", e);
-
-            if(e.getCause() instanceof OverwriteException) {
-                throw new OverwriteException();
+            if (e.getCause() instanceof RuntimeException) {
+                throw (RuntimeException)e.getCause();
             } else {
                 throw new RuntimeException(e);
             }
         }
     }
 
-    @Override
-    public void delete(K key, V value, RemovalCause removalCause) {}
+    public void trim(@Nonnull LogAddress logAddress) {
+        try {
+            CompletableFuture<Void> cf = new CompletableFuture();
+            operationsQueue.add(new BatchWriterOperation(BatchWriterOperation.Type.TRIM, logAddress, null, cf));
+            cf.get();
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
 
-    private CompletableFuture<Void> submitWrite(LogAddress address, LogData logData) {
-        CompletableFuture<Void> cf = new CompletableFuture();
-        writeQueue.add(new WriteOperation(address, logData,cf));
-        return cf;
+    @Override
+    public void delete(K key, V value, RemovalCause removalCause) {
+    }
+
+    private void handleOperationResults(BatchWriterOperation operation) {
+        if (operation.getException() == null) {
+            operation.getFuture().complete(null);
+        } else {
+            operation.getFuture().completeExceptionally(operation.getException());
+        }
     }
 
     private void batchWriteProcessor() {
         try {
-            WriteOperation lastOp = null;
-
+            BatchWriterOperation lastOp = null;
             int processed = 0;
-
-            List<CompletableFuture> ack = new LinkedList();
-            List<CompletableFuture> err = new LinkedList();
+            List<BatchWriterOperation> res = new LinkedList();
 
             while (true) {
-                WriteOperation currOp;
+                BatchWriterOperation currOp;
 
                 if (lastOp == null) {
-                    currOp = writeQueue.take();
+                    currOp = operationsQueue.take();
                 } else {
-                    currOp = writeQueue.poll();
+                    currOp = operationsQueue.poll();
 
-                    if (currOp == null || processed == BATCH_SIZE || currOp == WriteOperation.SHUTDOWN) {
-                        streamLog.sync();
+                    if (currOp == null || processed == BATCH_SIZE || currOp == BatchWriterOperation.SHUTDOWN) {
+                        streamLog.sync(true);
                         log.trace("Sync'd {} writes", processed);
 
-                        for(CompletableFuture cf : ack) {
-                            cf.complete(null);
+                        for (BatchWriterOperation operation : res) {
+                            handleOperationResults(operation);
                         }
-
-                        for(CompletableFuture cf : err) {
-                            cf.completeExceptionally(new OverwriteException());
-                        }
-
-                        ack.clear();
-                        err.clear();
+                        res.clear();
                         processed = 0;
                     }
                 }
 
-                if (currOp == WriteOperation.SHUTDOWN) {
+                if (currOp == BatchWriterOperation.SHUTDOWN) {
                     log.trace("Shutting down the write processor");
                     break;
                 }
@@ -103,11 +114,24 @@ public class BatchWriter <K, V> implements CacheWriter<K, V>, AutoCloseable {
                     continue;
                 }
 
-                try {
-                    streamLog.append(currOp.getLogAddress(), currOp.getLogData());
-                    ack.add(currOp.getFuture());
-                } catch (OverwriteException e) {
-                    err.add(currOp.getFuture());
+                if (currOp.getType() == BatchWriterOperation.Type.TRIM) {
+                    streamLog.trim(currOp.getLogAddress());
+                    currOp.setException(null);
+                    res.add(currOp);
+                } else if (currOp.getType() == BatchWriterOperation.Type.WRITE) {
+                    try {
+                        streamLog.append(currOp.getLogAddress(), currOp.getLogData());
+                        currOp.setException(null);
+                        res.add(currOp);
+                    } catch (OverwriteException | DataOutrankedException e) {
+                        currOp.setException(e);
+                        res.add(currOp);
+                    } catch (Exception e) {
+                        currOp.setException(e);
+                        res.add(currOp);
+                    }
+                } else {
+                    log.warn("Unknown BatchWriterOperation {}", currOp);
                 }
 
                 processed++;
@@ -120,7 +144,7 @@ public class BatchWriter <K, V> implements CacheWriter<K, V>, AutoCloseable {
 
     @Override
     public void close() {
-        writeQueue.add(WriteOperation.SHUTDOWN);
+        operationsQueue.add(BatchWriterOperation.SHUTDOWN);
         writerService.shutdown();
     }
 

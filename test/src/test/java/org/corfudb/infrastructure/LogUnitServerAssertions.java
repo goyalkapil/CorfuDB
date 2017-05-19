@@ -1,10 +1,10 @@
 package org.corfudb.infrastructure;
 
 import io.netty.buffer.ByteBuf;
-import io.netty.buffer.UnpooledByteBufAllocator;
+import io.netty.buffer.Unpooled;
 import org.assertj.core.api.AbstractAssert;
 import org.corfudb.infrastructure.log.LogAddress;
-import org.corfudb.util.AutoCloseableByteBuf;
+import org.corfudb.protocols.wireprotocol.LogData;
 import org.corfudb.util.serializer.Serializers;
 
 
@@ -62,15 +62,25 @@ public class LogUnitServerAssertions extends AbstractAssert<LogUnitServerAsserti
         if (actual.getDataCache().get(new LogAddress(address, null)) == null) {
             failWithMessage("Expected address <%d> to contain data but was empty!", address);
         } else {
-            try (AutoCloseableByteBuf b = new AutoCloseableByteBuf(UnpooledByteBufAllocator.DEFAULT.buffer())) {
-                Serializers.CORFU.serialize(data, b);
-                byte[] expected = new byte[b.readableBytes()];
-                b.getBytes(0, expected);
+            ByteBuf b = Unpooled.buffer();
+            Serializers.CORFU.serialize(data, b);
+            byte[] expected = new byte[b.readableBytes()];
+            b.getBytes(0, expected);
 
-                org.assertj.core.api.Assertions.assertThat(actual.getDataCache()
-                                .get(new LogAddress(address, null)).getData())
-                        .isEqualTo(expected);
-            }
+            org.assertj.core.api.Assertions.assertThat(((LogData)actual.getDataCache()
+                    .get(new LogAddress(address, null))).getData())
+                    .isEqualTo(expected);
+
+        }
+
+        return this;
+    }
+
+    public LogUnitServerAssertions hasCorrectCacheSize(double ratio) {
+        long maxHeapSize = Runtime.getRuntime().maxMemory();
+        if(actual.getMaxCacheSize() != (long) (maxHeapSize * ratio)) {
+            failWithMessage("Expected cache size <%d> doesn't match allocated cache size <%d>",
+                    (long) (maxHeapSize * ratio), actual.getMaxCacheSize());
         }
 
         return this;

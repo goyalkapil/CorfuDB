@@ -18,7 +18,7 @@ import java.lang.reflect.Constructor;
 @AllArgsConstructor
 public enum CorfuMsgType {
     // Base Messages
-    PING(0, TypeToken.of(CorfuMsg.class), true),
+    PING(0, TypeToken.of(CorfuMsg.class)),
     PONG(1, TypeToken.of(CorfuMsg.class), true),
     RESET(2, TypeToken.of(CorfuMsg.class), true),
     SET_EPOCH(3, new TypeToken<CorfuPayloadMsg<Long>>() {}, true),
@@ -43,6 +43,7 @@ public enum CorfuMsgType {
     // Sequencer Messages
     TOKEN_REQ(20, new TypeToken<CorfuPayloadMsg<TokenRequest>>(){}),
     TOKEN_RES(21, new TypeToken<CorfuPayloadMsg<TokenResponse>>(){}),
+    RESET_SEQUENCER(22, new TypeToken<CorfuPayloadMsg<Long>>(){}),
 
     // Logging Unit Messages
     WRITE(30, new TypeToken<CorfuPayloadMsg<WriteRequest>>() {}),
@@ -53,7 +54,8 @@ public enum CorfuMsgType {
     FORCE_GC(35, TypeToken.of(CorfuMsg.class)),
     GC_INTERVAL(36, new TypeToken<CorfuPayloadMsg<Long>>() {}),
     FORCE_COMPACT(37, TypeToken.of(CorfuMsg.class)),
-    COMMIT(40, new TypeToken<CorfuPayloadMsg<CommitRequest>>() {}),
+    TAIL_REQUEST(41, TypeToken.of(CorfuMsg.class), true),
+    TAIL_RESPONSE(42, new TypeToken<CorfuPayloadMsg<Long>>(){}, true),
 
     WRITE_OK(50, TypeToken.of(CorfuMsg.class)),
     ERROR_TRIMMED(51, TypeToken.of(CorfuMsg.class)),
@@ -61,8 +63,10 @@ public enum CorfuMsgType {
     ERROR_OOS(53, TypeToken.of(CorfuMsg.class)),
     ERROR_RANK(54, TypeToken.of(CorfuMsg.class)),
     ERROR_NOENTRY(55, TypeToken.of(CorfuMsg.class)),
-    ERROR_REPLEX_OVERWRITE(56, TypeToken.of(CorfuMsg.class)),
     ERROR_DATA_CORRUPTION(57, new TypeToken<CorfuPayloadMsg<ReadResponse>>() {}),
+    ERROR_DATA_OUTRANKED(58, TypeToken.of(CorfuMsg.class)),
+    ERROR_VALUE_ADOPTED(59,new TypeToken<CorfuPayloadMsg<ReadResponse>>() {}),
+
 
     // EXTRA CODES
     LAYOUT_ALREADY_BOOTSTRAP(60, TypeToken.of(CorfuMsg.class), true),

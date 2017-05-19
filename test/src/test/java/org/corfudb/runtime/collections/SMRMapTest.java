@@ -8,7 +8,6 @@ import lombok.ToString;
 import org.corfudb.runtime.CorfuRuntime;
 import org.corfudb.runtime.exceptions.TransactionAbortedException;
 import org.corfudb.runtime.object.ICorfuSMR;
-import org.corfudb.runtime.object.transactions.TransactionType;
 import org.corfudb.runtime.view.AbstractViewTest;
 import org.corfudb.runtime.view.ObjectOpenOptions;
 import org.corfudb.util.serializer.Serializers;
@@ -58,6 +57,35 @@ public class SMRMapTest extends AbstractViewTest {
                 .isEqualTo("a");
         assertThat(testMap.get("a"))
                 .isEqualTo("b");
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    public void canWriteScanAndFilterToSingle()
+            throws Exception {
+        Map<String, String> corfuInstancesMap = getRuntime()
+                .getObjectsView()
+                .build()
+                .setStreamName("test")
+                .setTypeToken(new TypeToken<SMRMap<String, String>>() {})
+                .open();
+
+        corfuInstancesMap.clear();
+        assertThat(corfuInstancesMap.put("a", "CorfuServer"))
+                .isNull();
+        assertThat(corfuInstancesMap.put("b", "CorfuClient"))
+                .isNull();
+        assertThat(corfuInstancesMap.put("c", "CorfuClient"))
+                .isNull();
+        assertThat(corfuInstancesMap.put("d", "CorfuServer"))
+                .isNull();
+        List<String> corfuServerList = ((SMRMap)corfuInstancesMap).scanAndFilter(p -> p.equals("CorfuServer"));
+
+        assertThat(corfuServerList.size()).isEqualTo(2);
+
+        for(String corfuInstance : corfuServerList) {
+            assertThat(corfuInstance).isEqualTo("CorfuServer");
+        }
     }
 
     @Test
@@ -161,8 +189,6 @@ public class SMRMapTest extends AbstractViewTest {
     @Test
     public void loadsFollowedByGetsConcurrent()
             throws Exception {
-        r.setBackpointersDisabled(true);
-
         Map<String, String> testMap = getRuntime().getObjectsView()
                 .build()
                 .setStreamID(UUID.randomUUID())
@@ -466,17 +492,23 @@ public class SMRMapTest extends AbstractViewTest {
                 .setTypeToken(new TypeToken<SMRMap<String, String>>() {})
                 .open();
 
-        getRuntime().getObjectsView().TXBegin();
         testMap.clear();
+        testMap.put("z", "z");
+        assertThat(testMap.size())
+                .isEqualTo(1);
+
+
+        getRuntime().getObjectsView().TXBegin();
         assertThat(testMap.put("a", "a"))
                 .isNull();
         assertThat(testMap.put("a", "b"))
                 .isEqualTo("a");
         assertThat(testMap.get("a"))
                 .isEqualTo("b");
+        testMap.clear();
         getRuntime().getObjectsView().TXAbort();
         assertThat(testMap.size())
-                .isEqualTo(0);
+                .isEqualTo(1);
     }
 
     @Test

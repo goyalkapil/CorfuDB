@@ -4,6 +4,7 @@ import com.google.common.collect.ImmutableMap;
 import io.netty.buffer.ByteBuf;
 import lombok.Getter;
 import lombok.Setter;
+import org.corfudb.util.Utils;
 
 import java.util.*;
 
@@ -11,10 +12,15 @@ import java.util.*;
  * Created by dmalkhi on 12/26/16.
  */
 public class TxResolutionInfo implements ICorfuPayload<TxResolutionInfo> {
+
+    @Getter
+    @Setter
+    UUID TXid; // transaction ID, mostly for debugging purposes
+
     /* snapshot timestamp of the txn. */
     @Getter
     @Setter
-    final Long snapshotTimestamp;
+    Long snapshotTimestamp;
 
     @Getter
     final Map<UUID, Set<Integer>> conflictSet;
@@ -22,19 +28,18 @@ public class TxResolutionInfo implements ICorfuPayload<TxResolutionInfo> {
     @Getter
     final Map<UUID, Set<Integer>>  writeConflictParams;
 
-    public TxResolutionInfo(long snapshotTS, Map<UUID, Set<Integer>> conflictMap, Map<UUID, Set<Integer>> writeConflictParams) {
+    public TxResolutionInfo(UUID TXid, long snapshotTS) {
+        this.TXid = TXid;
         this.snapshotTimestamp = snapshotTS;
-        this.conflictSet = conflictMap;
-        this.writeConflictParams = writeConflictParams;
+        this.conflictSet = Collections.emptyMap();
+        this.writeConflictParams = Collections.emptyMap();
     }
 
-
-    public TxResolutionInfo(long readTS, Set<UUID> streams,  Map<UUID, Set<Integer>> writeConflictParams) {
-        this.snapshotTimestamp = readTS;
-        ImmutableMap.Builder<UUID, Set<Integer>> conflictMapBuilder = new ImmutableMap.Builder<>();
-        if (streams != null)
-            streams.forEach(streamID -> conflictMapBuilder.put(streamID, new HashSet<>()));
-        conflictSet = conflictMapBuilder.build();
+    public TxResolutionInfo(UUID TXid, long snapshotTS, Map<UUID, Set<Integer>>
+            conflictMap, Map<UUID, Set<Integer>> writeConflictParams) {
+        this.TXid = TXid;
+        this.snapshotTimestamp = snapshotTS;
+        this.conflictSet = conflictMap;
         this.writeConflictParams = writeConflictParams;
     }
 
@@ -48,6 +53,7 @@ public class TxResolutionInfo implements ICorfuPayload<TxResolutionInfo> {
      * @param buf        The buffer to deserialize.
      */
     public TxResolutionInfo(ByteBuf buf) {
+        TXid = ICorfuPayload.fromBuffer(buf, UUID.class);
         snapshotTimestamp = buf.readLong();
 
         // conflictSet
@@ -77,6 +83,7 @@ public class TxResolutionInfo implements ICorfuPayload<TxResolutionInfo> {
      */
     @Override
     public void doSerialize(ByteBuf buf) {
+        ICorfuPayload.serialize(buf, TXid);
         buf.writeLong(snapshotTimestamp);
 
         // conflictSet
@@ -93,5 +100,12 @@ public class TxResolutionInfo implements ICorfuPayload<TxResolutionInfo> {
             ICorfuPayload.serialize(buf, x.getValue());
         });
     }
+
+    @Override
+    public String toString() {
+        return "TXINFO[" + Utils.toReadableID(TXid) + "](ts="
+                + snapshotTimestamp + ")";
+    }
+
 }
 

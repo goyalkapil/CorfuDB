@@ -3,16 +3,11 @@ package org.corfudb.runtime.object.transactions;
 import org.corfudb.runtime.collections.ISMRMap;
 import org.corfudb.runtime.collections.SMRMap;
 import org.corfudb.runtime.exceptions.TransactionAbortedException;
-import org.corfudb.runtime.view.AbstractViewTest;
-import org.junit.Before;
 import org.junit.Test;
 
 import java.util.ArrayList;
 import java.util.Random;
 import java.util.concurrent.atomic.AtomicInteger;
-
-import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.fail;
 
 /**
  * These tests generate workloads with mixed reads/writes on multiple maps.
@@ -22,13 +17,11 @@ import static org.assertj.core.api.Assertions.fail;
  *
  * Created by dmalkhi on 12/13/16.
  */
-public class StreamTest extends AbstractObjectTest {
+public class StreamTest extends AbstractTransactionsTest {
     @Override
-    protected void TXBegin() {
-        getRuntime().getObjectsView().TXBuild()
-                .setType(TransactionType.WRITE_AFTER_WRITE)
-                .begin();
-    }
+    public void TXBegin() { OptimisticTXBegin(); }
+
+
 
     /**
      * This workload operates over three distinct maps
@@ -61,7 +54,7 @@ public class StreamTest extends AbstractObjectTest {
 
 
         // generate multi-stream entries
-        TXBegin();
+        WWTXBegin();
         for (int i = 0; i < smallNumber; i++) {
             map1.put("m1" + i, i);
             map2.put("m2" + i, i);
@@ -74,10 +67,10 @@ public class StreamTest extends AbstractObjectTest {
 
         for (int j = 0; j < concurrency; j++)
             t(j, () -> {
-                TXBegin();
+                WWTXBegin();
             });
 
-        t(concurrency, () -> { TXBegin(); map2.put("foo", 0); TXEnd(); });
+        t(concurrency, () -> { WWTXBegin(); map2.put("foo", 0); TXEnd(); });
 
         // now, thread 0..concurrency-1 have to go back in
         // the stream of map3 to its snapshot-position
@@ -107,7 +100,7 @@ public class StreamTest extends AbstractObjectTest {
 
         // populate maps
         for (int i = 0; i < NUM_BATCHES; i++) {
-            TXBegin();
+            WWTXBegin();
             for (int j = 0; j < BATCH_SZ; j++) {
                 map1.put("m1" + (i * BATCH_SZ + j), i);
                 map2.put("m2" + (i * BATCH_SZ + j), i);
@@ -131,7 +124,7 @@ public class StreamTest extends AbstractObjectTest {
             final int fi = i;
 
             addTestStep(task_num -> {
-                TXBegin();
+                WWTXBegin();
             });
 
             for (int j = 0; j < BATCH_SZ; j++) {
@@ -143,13 +136,9 @@ public class StreamTest extends AbstractObjectTest {
                     int r2 = rand.nextInt(numTasks);
                     int r3 = rand.nextInt(numTasks);
                     int accumulator = 0;
-                    try {
-                        accumulator += map1.get("m1" + r1);
-                        accumulator += map2.get("m2" + r2);
-                        accumulator += map3.get("m3" + r3);
-                    } catch (Exception e) {
-                        e.printStackTrace();
-                    }
+                    accumulator += map1.get("m1" + r1);
+                    accumulator += map2.get("m2" + r2);
+                    accumulator += map3.get("m3" + r3);
 
                     // perform random put()'s with probability '1 - readPercent/100'
                     if (rand.nextInt(MAX_PERCENT) >= readPrecent) {

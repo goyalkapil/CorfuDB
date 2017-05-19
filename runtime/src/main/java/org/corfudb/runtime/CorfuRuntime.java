@@ -1,5 +1,7 @@
 package org.corfudb.runtime;
 
+import com.codahale.metrics.MetricRegistry;
+import lombok.Data;
 import lombok.Getter;
 import lombok.Setter;
 import lombok.experimental.Accessors;
@@ -12,6 +14,7 @@ import org.corfudb.runtime.view.ObjectsView;
 import org.corfudb.runtime.view.SequencerView;
 import org.corfudb.runtime.view.StreamsView;
 import org.corfudb.util.GitRepositoryState;
+import org.corfudb.util.MetricsUtils;
 import org.corfudb.util.Version;
 
 import java.util.*;
@@ -29,6 +32,21 @@ import java.util.stream.Collectors;
 @Accessors(chain = true)
 public class CorfuRuntime {
 
+    @Data
+    public static class CorfuRuntimeParameters {
+
+        /** True, if undo logging is disabled. */
+        boolean undoDisabled = false;
+
+        /** True, if optimistic undo logging is disabled. */
+        boolean optimisticUndoDisabled = false;
+
+        /** Number of times to attempt to read before hole filling. */
+        int holeFillRetry = 10;
+    }
+
+    @Getter
+    private final CorfuRuntimeParameters parameters = new CorfuRuntimeParameters();
     /**
      * A view of the layout service in the Corfu server instance.
      */
@@ -45,7 +63,7 @@ public class CorfuRuntime {
     @Getter(lazy = true)
     private final AddressSpaceView addressSpaceView = new AddressSpaceView(this);
     /**
-     * A view of streams in the Corfu server instance.
+     * A view of streamsView in the Corfu server instance.
      */
     @Getter(lazy = true)
     private final StreamsView streamsView = new StreamsView(this);
@@ -83,7 +101,8 @@ public class CorfuRuntime {
      * The maximum size of the cache, in bytes.
      */
     @Getter
-    public int maxCacheSize = 100_000_000;
+    @Setter
+    public long maxCacheSize = 4_000_000_000L;
 
     /**
      * Whether or not to disable backpointers.
@@ -114,6 +133,21 @@ public class CorfuRuntime {
     private boolean saslPlainTextEnabled = false;
     private String usernameFile;
     private String passwordFile;
+
+    /**
+     * Metrics: meter (counter), histogram
+     */
+    static private final String mp = "corfu.runtime.";
+    @Getter
+    static private final String mpASV = mp + "as-view.";
+    @Getter
+    static private final String mpLUC = mp + "log-unit-client.";
+    @Getter
+    static private final String mpCR = mp + "client-router.";
+    @Getter
+    static private final String mpObj = mp + "object.";
+    @Getter
+    static public final MetricRegistry metrics = new MetricRegistry();
 
     /**
      * When set, overrides the default getRouterFunction. Used by the testing
@@ -160,6 +194,12 @@ public class CorfuRuntime {
         layoutServers = new ArrayList<>();
         nodeRouters = new ConcurrentHashMap<>();
         retryRate = 5;
+        synchronized (metrics) {
+            if (metrics.getNames().isEmpty()) {
+                MetricsUtils.addJVMMetrics(metrics, mp);
+                MetricsUtils.metricsReportingSetup(metrics);
+            }
+        }
         log.debug("Corfu runtime version {} initialized.", getVersionString());
     }
 
@@ -205,6 +245,7 @@ public class CorfuRuntime {
                 log.error("Runtime shutting down. Exception in terminating fetchLayout: {}", e);
             }
         }
+        stop(true);
     }
 
     /**
@@ -214,11 +255,11 @@ public class CorfuRuntime {
         stop(false);
     }
 
-    public void stop(boolean shutdown_p) {
+    public void stop(boolean shutdown) {
         for (IClientRouter r: nodeRouters.values()) {
-            r.stop(shutdown_p);
+            r.stop(shutdown);
         }
-        if (shutdown_p) {
+        if (!shutdown) {
             // N.B. An icky side-effect of this clobbering is leaking
             // Pthreads, namely the Netty client-side worker threads.
             nodeRouters = new ConcurrentHashMap<>();

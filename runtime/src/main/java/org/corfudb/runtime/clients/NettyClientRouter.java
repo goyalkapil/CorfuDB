@@ -1,5 +1,9 @@
 package org.corfudb.runtime.clients;
 
+import com.codahale.metrics.Counter;
+import com.codahale.metrics.Gauge;
+import com.codahale.metrics.MetricRegistry;
+import com.codahale.metrics.Timer;
 import io.netty.bootstrap.Bootstrap;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelFuture;
@@ -15,29 +19,24 @@ import io.netty.channel.socket.nio.NioSocketChannel;
 import io.netty.handler.codec.LengthFieldBasedFrameDecoder;
 import io.netty.handler.codec.LengthFieldPrepender;
 import io.netty.handler.ssl.SslContext;
-import io.netty.handler.ssl.SslContextBuilder;
-import io.netty.handler.ssl.SslHandler;
 import io.netty.util.concurrent.DefaultEventExecutorGroup;
 import io.netty.util.concurrent.EventExecutorGroup;
 import lombok.Getter;
 import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
-import org.codehaus.groovy.tools.shell.IO;
 import org.corfudb.protocols.wireprotocol.CorfuMsg;
 import org.corfudb.protocols.wireprotocol.CorfuMsgType;
 import org.corfudb.protocols.wireprotocol.NettyCorfuMessageDecoder;
 import org.corfudb.protocols.wireprotocol.NettyCorfuMessageEncoder;
+import org.corfudb.runtime.CorfuRuntime;
 import org.corfudb.runtime.exceptions.NetworkException;
 import org.corfudb.runtime.exceptions.WrongEpochException;
 import org.corfudb.security.sasl.plaintext.PlainTextSaslNettyClient;
 import org.corfudb.security.sasl.SaslUtils;
 import org.corfudb.security.tls.TlsUtils;
 import org.corfudb.util.CFUtils;
+import org.corfudb.util.MetricsUtils;
 
-import java.io.FileInputStream;
-import java.nio.file.Files;
-import java.nio.file.Paths;
-import java.security.KeyStore;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
@@ -50,7 +49,6 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
-import javax.net.ssl.*;
 
 /**
  * A client router which multiplexes operations over the Netty transport.
@@ -61,6 +59,17 @@ import javax.net.ssl.*;
 @ChannelHandler.Sharable
 public class NettyClientRouter extends SimpleChannelInboundHandler<CorfuMsg>
         implements IClientRouter {
+
+    /**
+     * Metrics: meter (counter), histogram
+     */
+    private Gauge<Integer> gaugeConnected;
+    private Timer timerConnect;
+    private Timer timerSyncOp;
+    private Counter counterConnectFailed;
+    private Counter counterSendDisconnected;
+    private Counter counterSendTimeout;
+    private Counter counterAsyncOpSent;
 
     /**
      * A random instance
@@ -132,7 +141,7 @@ public class NettyClientRouter extends SimpleChannelInboundHandler<CorfuMsg>
     /**
      * Whether or not this router is shutdown.
      */
-    volatile public boolean shutdown;
+    public volatile boolean shutdown;
     /**
      * The host that this router is routing requests for.
      */
@@ -147,7 +156,7 @@ public class NettyClientRouter extends SimpleChannelInboundHandler<CorfuMsg>
      * Are we connected?
      */
     @Getter
-    Boolean connected_p;
+    volatile Boolean connected;
 
     private Bootstrap b;
 
@@ -178,7 +187,7 @@ public class NettyClientRouter extends SimpleChannelInboundHandler<CorfuMsg>
         this.port = port;
 
         clientID = UUID.randomUUID();
-        connected_p = false;
+        connected = false;
         timeoutConnect = 500;
         timeoutResponse = 5000;
         timeoutRetry = 1000;
@@ -188,6 +197,20 @@ public class NettyClientRouter extends SimpleChannelInboundHandler<CorfuMsg>
         requestID = new AtomicLong();
         outstandingRequests = new ConcurrentHashMap<>();
         shutdown = true;
+
+        MetricRegistry metrics = CorfuRuntime.getMetrics();
+        String pfx = CorfuRuntime.getMpCR() + host + ":" + port.toString() + ".";
+        synchronized (metrics) {
+            if (!metrics.getNames().contains(pfx + "connected")) {
+                gaugeConnected = metrics.register(pfx + "connected", () -> connected ? 1 : 0);
+            }
+        }
+        timerConnect = metrics.timer(pfx + "connect");
+        timerSyncOp = metrics.timer(pfx + "sync-op");
+        counterConnectFailed = metrics.counter(pfx + "connect-failed");
+        counterSendDisconnected = metrics.counter(pfx + "send-disconnected");
+        counterSendTimeout = metrics.counter(pfx + "send-timeout");
+        counterAsyncOpSent = metrics.counter(pfx + "async-op-sent");
 
         if (tls) {
             sslContext =
@@ -335,35 +358,40 @@ public class NettyClientRouter extends SimpleChannelInboundHandler<CorfuMsg>
         }
     }
 
-    synchronized void connectChannel(Bootstrap b, long c)
-    throws InterruptedException {
-        ChannelFuture cf = b.connect(host, port);
-        cf.syncUninterruptibly();
-        if (!cf.awaitUninterruptibly(timeoutConnect)) {
-            cf.channel().close();   // close port
-            throw new NetworkException(c + " Timeout connectChannel to endpoint", host + ":" + port);
+    synchronized void connectChannel(Bootstrap b, long c) {
+        boolean isEnabled = MetricsUtils.isMetricsCollectionEnabled();
+        try (Timer.Context context = MetricsUtils.getConditionalContext(isEnabled, timerConnect)) {
+            ChannelFuture cf = b.connect(host, port);
+            cf.syncUninterruptibly();
+            if (!cf.awaitUninterruptibly(timeoutConnect)) {
+                cf.channel().close();   // close port
+                MetricsUtils.incConditionalCounter(isEnabled, counterConnectFailed, 1);
+                throw new NetworkException(c + " Timeout connecting to endpoint", host + ":" + port);
+            }
+            channel = cf.channel();
         }
-        channel = cf.channel();
         channel.closeFuture().addListener((r) -> {
-            connected_p = false;
+            connected = false;
             outstandingRequests.forEach((ReqID, reqCF) -> {
+                MetricsUtils.incConditionalCounter(isEnabled, counterSendDisconnected, 1);
                 reqCF.completeExceptionally(new NetworkException("Disconnected", host + ":" + port));
                 outstandingRequests.remove(ReqID);
             });
             if (!shutdown) {
                 log.trace("Disconnected, reconnecting...");
-                while (true) {
+                while (!shutdown) {
                     try {
                         connectChannel(b, c);
                         return;
                     } catch (Exception ex) {
+                        MetricsUtils.incConditionalCounter(isEnabled, counterConnectFailed, 1);
                         log.trace("Exception while reconnecting, retry in {} ms", timeoutRetry);
                         Thread.sleep(timeoutRetry);
                     }
                 }
             }
         });
-        connected_p = true;
+        connected = true;
     }
 
     /**
@@ -375,15 +403,31 @@ public class NettyClientRouter extends SimpleChannelInboundHandler<CorfuMsg>
     }
 
     @Override
-    public void stop(boolean shutdown_p) {
+    public void stop(boolean shutdown) {
         // A very hasty check of Netty state-of-the-art is that shutting down
         // the worker threads is tricksy or impossible.
-        shutdown = shutdown_p;
-        connected_p = false;
+        this.shutdown = shutdown;
+        connected = false;
 
-        ChannelFuture cf = channel.disconnect();
-        cf.syncUninterruptibly();
-        boolean b1 = cf.awaitUninterruptibly(1000);
+        if (shutdown) {
+            try {
+                ChannelFuture cf = channel.close();
+                cf.syncUninterruptibly();
+                cf.awaitUninterruptibly(1000);
+            } catch (Exception e) {
+                log.error("Error in closing channel");
+            }
+            try {
+                ee.shutdownGracefully().sync();
+                workerGroup.shutdownGracefully().sync();
+            } catch (InterruptedException e) {
+                log.error("Interrupted exception in shutting event pool : {}", e);
+            }
+        } else {
+            ChannelFuture cf = channel.disconnect();
+            cf.syncUninterruptibly();
+            boolean b1 = cf.awaitUninterruptibly(1000);
+        }
     }
 
     /**
@@ -396,10 +440,13 @@ public class NettyClientRouter extends SimpleChannelInboundHandler<CorfuMsg>
      * or a timeout in the case there is no response.
      */
     public <T> CompletableFuture<T> sendMessageAndGetCompletable(ChannelHandlerContext ctx, CorfuMsg message) {
-        if (!connected_p) {
+        boolean isEnabled = MetricsUtils.isMetricsCollectionEnabled();
+        if (!connected) {
             log.trace("Disconnected endpoint " + host + ":" + port);
+            MetricsUtils.incConditionalCounter(isEnabled, counterSendDisconnected, 1);
             throw new NetworkException("Disconnected endpoint", host + ":" + port);
         } else {
+            Timer.Context context = MetricsUtils.getConditionalContext(isEnabled, timerSyncOp);
             // Get the next request ID.
             final long thisRequest = requestID.getAndIncrement();
             // Set the message fields.
@@ -417,9 +464,14 @@ public class NettyClientRouter extends SimpleChannelInboundHandler<CorfuMsg>
                 ctx.writeAndFlush(message);
             }
             log.trace("Sent message: {}", message);
+            final CompletableFuture<T> cfElapsed = cf.thenApply(x -> {
+                MetricsUtils.stopConditionalContext(context);
+                return x;
+            });
             // Generate a timeout future, which will complete exceptionally if the main future is not completed.
-            final CompletableFuture<T> cfTimeout = CFUtils.within(cf, Duration.ofMillis(timeoutResponse));
+            final CompletableFuture<T> cfTimeout = CFUtils.within(cfElapsed, Duration.ofMillis(timeoutResponse));
             cfTimeout.exceptionally(e -> {
+                MetricsUtils.incConditionalCounter(isEnabled, counterSendTimeout, 1);
                 outstandingRequests.remove(thisRequest);
                 log.debug("Remove request {} due to timeout!", thisRequest);
                 return null;
@@ -452,6 +504,7 @@ public class NettyClientRouter extends SimpleChannelInboundHandler<CorfuMsg>
         message.setEpoch(epoch);
         // Write this message out on the channel.
         outContext.writeAndFlush(message);
+        MetricsUtils.incConditionalCounter(MetricsUtils.isMetricsCollectionEnabled(), counterAsyncOpSent, 1);
         log.trace("Sent one-way message: {}", message);
     }
 

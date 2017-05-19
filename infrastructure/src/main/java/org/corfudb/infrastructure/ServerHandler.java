@@ -12,4 +12,5 @@ import java.lang.annotation.*;
 @Inherited
 public @interface ServerHandler {
     CorfuMsgType type();
+    String opTimer() default ""; // Registry's name of timer to be used for this operation
 }

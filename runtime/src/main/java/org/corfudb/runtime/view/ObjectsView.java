@@ -5,9 +5,12 @@ import lombok.Getter;
 import lombok.NonNull;
 import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
+import org.corfudb.protocols.wireprotocol.TxResolutionInfo;
 import org.corfudb.runtime.CorfuRuntime;
+import org.corfudb.runtime.exceptions.AbortCause;
 import org.corfudb.runtime.exceptions.TransactionAbortedException;
-import org.corfudb.runtime.object.*;
+import org.corfudb.runtime.object.CorfuCompileWrapperBuilder;
+import org.corfudb.runtime.object.ICorfuSMR;
 import org.corfudb.runtime.object.transactions.AbstractTransactionalContext;
 import org.corfudb.runtime.object.transactions.TransactionBuilder;
 import org.corfudb.runtime.object.transactions.TransactionType;
@@ -15,10 +18,9 @@ import org.corfudb.runtime.object.transactions.TransactionalContext;
 import org.corfudb.runtime.view.stream.IStreamView;
 import org.corfudb.util.serializer.Serializers;
 
-import java.util.Collections;
+import java.util.Arrays;
 import java.util.Map;
 import java.util.UUID;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -38,56 +40,12 @@ public class ObjectsView extends AbstractView {
     @Setter
     boolean transactionLogging = false;
 
-    @Getter
-    Map<Long, CompletableFuture> txFuturesMap = new ConcurrentHashMap<>();
 
     @Getter
     Map<ObjectID, Object> objectCache = new ConcurrentHashMap<>();
 
     public ObjectsView(CorfuRuntime runtime) {
         super(runtime);
-    }
-
-    /**
-     * Gets a view of an object in the Corfu instance.
-     *
-     * @param streamID The stream that the object should be read from.
-     * @param type     The type of the object that should be opened.
-     *                 If the type implements ICorfuSMRObject or implements an interface which implements
-     *                 ISMRInterface, Accessors, Mutator and MutatorAccessor annotations will be respected.
-     *                 Otherwise, the entire object will be wrapped around SMR and it will be assumed that
-     *                 all methods are MutatorAccessors.
-     * @param <T>      The type of object to return.
-     * @return Returns a view of the object in a Corfu instance.
-     */
-    @Deprecated
-    public <T> T open(@NonNull UUID streamID, @NonNull Class<T> type, Object... args) {
-        return build()
-                .setType(type)
-                .setStreamID(streamID)
-                .setArgumentsArray(args)
-                .open();
-    }
-
-    /**
-     * Gets a view of an object in the Corfu instance.
-     *
-     * @param streamName The stream that the object should be read from.
-     * @param type       The type of the object that should be opened.
-     *                   If the type implements ICorfuSMRObject or implements an interface which implements
-     *                   ISMRInterface, Accessors, Mutator and MutatorAccessor annotations will be respected.
-     *                   Otherwise, the entire object will be wrapped around SMR and it will be assumed that
-     *                   all methods are MutatorAccessors.
-     * @param <T>        The type of object to return.
-     * @return Returns a view of the object in a Corfu instance.
-     */
-    @Deprecated
-    public <T> T open(@NonNull String streamName, @NonNull Class<T> type, Object... args) {
-        return new ObjectBuilder<T>(runtime)
-                .setType(type)
-                .setStreamName(streamName)
-                .setArgumentsArray(args)
-                .open();
     }
 
     /**
@@ -109,33 +67,20 @@ public class ObjectsView extends AbstractView {
      */
     @SuppressWarnings("unchecked")
     public <T> T copy(@NonNull T obj, @NonNull UUID destination) {
-        try {
-            // to be deprecated
-            CorfuSMRObjectProxy<T> proxy = (CorfuSMRObjectProxy<T>) ((ICorfuSMRObject) obj).getProxy();
-            ObjectID oid = new ObjectID(destination, proxy.getOriginalClass(), null);
-            return (T) objectCache.computeIfAbsent(oid, x -> {
-                IStreamView sv = runtime.getStreamsView().copy(proxy.getSv().getID(),
-                        destination, proxy.getTimestamp());
-                return CorfuProxyBuilder.getProxy(proxy.getOriginalClass(), null, sv, runtime,
-                        proxy.getSerializer(), Collections.emptySet());
-            });
-        } catch (Exception e) {
-            // new code path
-            ICorfuSMR<T> proxy = (ICorfuSMR<T>)obj;
-            ObjectID oid = new ObjectID(destination, proxy.getCorfuSMRProxy().getObjectType(), null);
-            return (T) objectCache.computeIfAbsent(oid, x -> {
-                IStreamView sv = runtime.getStreamsView().copy(proxy.getCorfuStreamID(),
-                        destination, proxy.getCorfuSMRProxy().getVersion());
-                try {
-                    return
-                            CorfuCompileWrapperBuilder.getWrapper(proxy.getCorfuSMRProxy().getObjectType(),
-                                    runtime, sv.getID(), null, Serializers.JSON);
-                }
-                catch (Exception ex) {
-                    throw new RuntimeException(ex);
-                }
-            });
-        }
+        ICorfuSMR<T> proxy = (ICorfuSMR<T>)obj;
+        ObjectID oid = new ObjectID(destination, proxy.getCorfuSMRProxy().getObjectType());
+        return (T) objectCache.computeIfAbsent(oid, x -> {
+            IStreamView sv = runtime.getStreamsView().copy(proxy.getCorfuStreamID(),
+                    destination, proxy.getCorfuSMRProxy().getVersion());
+            try {
+                return
+                        CorfuCompileWrapperBuilder.getWrapper(proxy.getCorfuSMRProxy().getObjectType(),
+                                runtime, sv.getID(), null, Serializers.JSON);
+            }
+            catch (Exception ex) {
+                throw new RuntimeException(ex);
+            }
+        });
     }
 
     /**
@@ -159,7 +104,7 @@ public class ObjectsView extends AbstractView {
      */
     public void TXBegin() {
         TXBuild()
-                .setType(TransactionType.OPTIMISTIC) // TODO:default needs to be configurable
+                .setType(TransactionType.OPTIMISTIC)
                 .begin();
     }
 
@@ -181,8 +126,10 @@ public class ObjectsView extends AbstractView {
         if (context == null) {
             log.warn("Attempted to abort a transaction, but no transaction active!");
         } else {
-            log.trace("Aborting transactional context {}.", context.getTransactionID());
-            context.abortTransaction();
+            TxResolutionInfo txInfo = new TxResolutionInfo(
+                    context.getTransactionID(), context.getSnapshotTimestamp());
+            context.abortTransaction(new TransactionAbortedException(
+                    txInfo, null, AbortCause.USER));
             TransactionalContext.removeContext();
         }
     }
@@ -211,10 +158,11 @@ public class ObjectsView extends AbstractView {
             log.warn("Attempted to end a transaction, but no transaction active!");
             return AbstractTransactionalContext.UNCOMMITTED_ADDRESS;
         } else {
+            // TODO remove this, doesn't belong here!
             long totalTime = System.currentTimeMillis() - context.getStartTime();
-            log.trace("Exiting (committing) transactional context {} (time={} ms).",
-                    context.getTransactionID(), totalTime);
-
+            log.trace("TXCommit[{}] time={} ms",
+                    context, totalTime);
+            // TODO up to here
                 try {
                     return TransactionalContext.getCurrentContext().commitTransaction();
                 } finally {
@@ -223,10 +171,32 @@ public class ObjectsView extends AbstractView {
         }
     }
 
+    /** Given a Corfu object, syncs the object to the most up to date version.
+     * If the object is not a Corfu object, this function won't do anything.
+     * @param object    The Corfu object to sync.
+     */
+    public void syncObject(Object object) {
+        if (object instanceof ICorfuSMR<?>) {
+            ICorfuSMR<?> corfuObject = (ICorfuSMR<?>) object;
+            corfuObject.getCorfuSMRProxy().sync();
+        }
+    }
+
+    /** Given a list of Corfu objects, syncs the objects to the most up to date
+     * version, possibly in parallel.
+     * @param objects   A list of Corfu objects to sync.
+     */
+    public void syncObject(Object... objects) {
+        Arrays.stream(objects)
+                .parallel()
+                .filter(x -> x instanceof ICorfuSMR<?>)
+                .map(x -> (ICorfuSMR<?>) x)
+                .forEach(x -> x.getCorfuSMRProxy().sync());
+    }
+
     @Data
-    public static class ObjectID<T, R> {
+    public static class ObjectID<T> {
         final UUID streamID;
         final Class<T> type;
-        final Class<R> overlay;
     }
 }

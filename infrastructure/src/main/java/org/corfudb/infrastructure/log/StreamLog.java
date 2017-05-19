@@ -14,22 +14,40 @@ public interface StreamLog {
 
     /**
      * Append an entry to the stream log.
-     * @param address
+     * @param logAddress
      * @param entry
      */
-    void append(LogAddress address, LogData entry);
+    void append(LogAddress logAddress, LogData entry);
 
     /**
      * Given an address, read the corresponding stream entry.
-     * @param address
+     * @param logAddress
      * @return Stream entry if it exists, otherwise return null
      */
-    LogData read(LogAddress address);
+    LogData read(LogAddress logAddress);
+
+    /**
+     * Mark a StreamLog address as trimmed.
+     * @param logAddress
+     */
+    void trim(LogAddress logAddress);
+
+    /**
+     * Remove all trimmed addresses from the StreamLog.
+     */
+    void compact();
+
+    /**
+     * Get the last global address that was written.
+     */
+    long getGlobalTail();
 
     /**
      * Sync the stream log file to secondary storage.
+     *
+     * @param force force data to secondary storage if true
      */
-    void sync() throws IOException;
+    void sync(boolean force) throws IOException;
 
     /**
      * Close the stream log.
@@ -39,7 +57,7 @@ public interface StreamLog {
     /**
      * unmap/release the memory for entry
      *
-     * @param address
+     * @param logAddress
      */
-    void release(LogAddress address, LogData entry);
+    void release(LogAddress logAddress, LogData entry);
 }

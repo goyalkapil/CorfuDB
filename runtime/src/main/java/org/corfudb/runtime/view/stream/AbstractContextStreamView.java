@@ -2,16 +2,14 @@ package org.corfudb.runtime.view.stream;
 
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
-import org.corfudb.protocols.logprotocol.LogEntry;
 import org.corfudb.protocols.logprotocol.StreamCOWEntry;
 import org.corfudb.protocols.wireprotocol.DataType;
 import org.corfudb.protocols.wireprotocol.ILogData;
-import org.corfudb.protocols.wireprotocol.LogData;
 import org.corfudb.runtime.CorfuRuntime;
 import org.corfudb.runtime.view.Address;
+import org.corfudb.util.Utils;
 
 import java.util.*;
-import java.util.concurrent.ConcurrentSkipListSet;
 import java.util.function.BiFunction;
 import java.util.function.Function;
 
@@ -49,28 +47,31 @@ public abstract class AbstractContextStreamView<T extends AbstractStreamContext>
      */
     final NavigableSet<T> streamContexts;
 
-    /** A function which creates a base context, representing the original
-     * stream.
+    /** A function which creates a context, given the stream ID and max global.
      */
-    final BiFunction<UUID, Long, T> baseContextFactory;
+    final BiFunction<UUID, Long, T> contextFactory;
+
+    /** The base context, which is always preserved. */
+    final T baseContext;
 
     /** Create a new abstract context stream view.
      *
      * @param runtime               The runtime.
      * @param id                    The id of the stream.
-     * @param baseContextFactory    A function which generates a context,
+     * @param contextFactory        A function which generates a context,
      *                              given the stream id and a maximum global
      *                              address.
      */
     public AbstractContextStreamView(final CorfuRuntime runtime,
                                      final UUID id,
                                      final BiFunction<UUID, Long, T>
-                                             baseContextFactory) {
+                                             contextFactory) {
         this.ID = id;
         this.runtime = runtime;
-        this.streamContexts = new ConcurrentSkipListSet<>();
-        this.baseContextFactory = baseContextFactory;
-        this.streamContexts.add(baseContextFactory.apply(id, Address.MAX));
+        this.streamContexts = new TreeSet<>();
+        this.contextFactory = contextFactory;
+        this.baseContext = contextFactory.apply(id, Address.MAX);
+        this.streamContexts.add(baseContext);
     }
 
     /**
@@ -78,7 +79,27 @@ public abstract class AbstractContextStreamView<T extends AbstractStreamContext>
      */
     public synchronized void reset() {
         this.streamContexts.clear();
-        this.streamContexts.add(baseContextFactory.apply(ID, Address.MAX));
+        baseContext.reset();
+        this.streamContexts.add(baseContext);
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public synchronized void seek(long globalAddress) {
+        // pop any stream context which has a max address
+        // less than the global address
+        while (this.streamContexts.size() > 1) {
+            if (this.streamContexts.first().maxGlobalAddress <
+                    globalAddress)
+            {
+                this.streamContexts.pollFirst();
+            }
+        }
+
+        // now request a seek on the context
+        this.streamContexts.first().seek(globalAddress);
     }
 
     /**
@@ -145,6 +166,10 @@ public abstract class AbstractContextStreamView<T extends AbstractStreamContext>
 
         // Nothing read, nothing to process.
         if (entries.size() == 0) {
+            // We've resolved up to maxGlobal, so remember it. (if it wasn't max)
+            if (maxGlobal != Address.MAX) {
+                getCurrentContext().globalPointer = maxGlobal;
+            }
             return entries;
         }
 
@@ -166,8 +191,12 @@ public abstract class AbstractContextStreamView<T extends AbstractStreamContext>
             entries.addAll(remainingUpTo(maxGlobal));
         }
 
-        // Otherwise update the pointer with the last entry
-        updatePointer(entries.get(entries.size() - 1));
+        // Otherwise update the pointer
+        if (maxGlobal != Address.MAX) {
+            getCurrentContext().globalPointer = maxGlobal;
+        } else {
+            updatePointer(entries.get(entries.size() - 1));
+        }
 
         // And return the entries.
         return entries;
@@ -238,8 +267,9 @@ public abstract class AbstractContextStreamView<T extends AbstractStreamContext>
      * @return      True, if the entry will update the context.
      */
     protected boolean doesEntryUpdateContext(final ILogData data) {
-        return data.containsStream(getCurrentContext().id) &&
-                data.getPayload(runtime) instanceof StreamCOWEntry;
+        return data.hasBackpointer(getCurrentContext().id) &&
+                data.getBackpointer(getCurrentContext().id)
+                        .equals(Address.COW_BACKPOINTER);
     }
 
     /** Update the global pointer, given an entry.
@@ -272,18 +302,38 @@ public abstract class AbstractContextStreamView<T extends AbstractStreamContext>
             // If this is a COW entry, we update the context as well.
             if (payload instanceof StreamCOWEntry) {
                 StreamCOWEntry ce = (StreamCOWEntry) payload;
-                streamContexts
-                        .add(baseContextFactory.apply(ce.getOriginalStream(),
-                                ce.getFollowUntil()));
+                pushNewContext(ce.getOriginalStream(),
+                                ce.getFollowUntil());
                 return true;
             }
         }
         return false;
     }
 
-    /** Get the current context. */
+    /** Get the current context.
+     *
+     * Should never throw a NoSuchElement exception because streamContexts should
+     * always at least have one element.
+     *
+     * */
     protected T getCurrentContext() {
         return streamContexts.first();
     }
 
+    /** Add a new context. */
+    protected void pushNewContext(UUID id, long maxGlobal) {
+        streamContexts.add(contextFactory.apply(id, maxGlobal));
+    }
+
+    protected void popContext() {
+        if (streamContexts.size() <= 1) {
+            throw new RuntimeException("Attempted to pop context with less than 1 context remaining!");
+        }
+        streamContexts.pollFirst();
+    }
+
+    @Override
+    public String toString() {
+        return Utils.toReadableID(baseContext.id) + "@" + getCurrentContext().globalPointer;
+    }
 }

@@ -1,17 +1,16 @@
 package org.corfudb.runtime.clients;
 
+import com.codahale.metrics.Timer;
 import com.google.common.collect.Range;
-import com.google.common.collect.RangeSet;
 import io.netty.buffer.ByteBuf;
-import io.netty.buffer.ByteBufAllocator;
+import io.netty.buffer.Unpooled;
 import io.netty.channel.ChannelHandlerContext;
 import lombok.Getter;
 import lombok.Setter;
+import org.corfudb.protocols.logprotocol.LogEntry;
 import org.corfudb.protocols.wireprotocol.*;
-import org.corfudb.runtime.exceptions.DataCorruptionException;
-import org.corfudb.runtime.exceptions.OutOfSpaceException;
-import org.corfudb.runtime.exceptions.OverwriteException;
-import org.corfudb.runtime.exceptions.ReplexOverwriteException;
+import org.corfudb.runtime.CorfuRuntime;
+import org.corfudb.runtime.exceptions.*;
 import org.corfudb.util.serializer.Serializers;
 
 import java.lang.invoke.MethodHandles;
@@ -32,6 +31,10 @@ public class LogUnitClient implements IClient {
     @Setter
     @Getter
     IClientRouter router;
+
+    public String getHost() { return router.getHost(); }
+
+    public Integer getPort() { return router.getPort(); }
 
     /** The handler and handlers which implement this client. */
     @Getter
@@ -78,18 +81,26 @@ public class LogUnitClient implements IClient {
         throw new OverwriteException();
     }
 
-    /** Handle an ERROR_REPLEX_OVERWRITE message.
+    /** Handle an ERROR_DATA_OUTRANKED message.
      *
      * @param msg   Incoming Message
      * @param ctx   Context
      * @param r     Router
      * @throws      OverwriteException
      */
-    @ClientHandler(type=CorfuMsgType.ERROR_REPLEX_OVERWRITE)
-    private static Object handleReplexOverwrite(CorfuMsg msg, ChannelHandlerContext ctx, IClientRouter r)
+    @ClientHandler(type=CorfuMsgType.ERROR_DATA_OUTRANKED)
+    private static Object handleDataOutranked(CorfuMsg msg, ChannelHandlerContext ctx, IClientRouter r)
             throws Exception
     {
-        throw new ReplexOverwriteException();
+        throw new DataOutrankedException();
+    }
+
+
+
+    @ClientHandler(type=CorfuMsgType.ERROR_VALUE_ADOPTED)
+    private static Object handleValueAdoptedResponse(CorfuPayloadMsg<ReadResponse> msg,
+                                             ChannelHandlerContext ctx, IClientRouter r) {
+        throw new ValueAdoptedException(msg.getPayload());
     }
 
     /** Handle an ERROR_OOS message.
@@ -160,6 +171,18 @@ public class LogUnitClient implements IClient {
     }
 
     /**
+     * Handle a TAIL_RESPONSE message
+     * @param msg   Incoming Message
+     * @param ctx   Context
+     * @param r     Router
+     */
+    @ClientHandler(type=CorfuMsgType.TAIL_RESPONSE)
+    private static Object handleTailResponse(CorfuPayloadMsg<Long> msg,
+                                             ChannelHandlerContext ctx, IClientRouter r) {
+        return msg.getPayload();
+    }
+
+    /**
      * Asynchronously write to the logging unit.
      *
      * @param address        The address to write to.
@@ -171,58 +194,49 @@ public class LogUnitClient implements IClient {
      * @return A CompletableFuture which will complete with the WriteResult once the
      * write completes.
      */
-    public CompletableFuture<Boolean> write(long address, Set<UUID> streams, long rank,
+    public CompletableFuture<Boolean> write(long address, Set<UUID> streams, IMetadata.DataRank rank,
                                             Object writeObject, Map<UUID, Long> backpointerMap) {
-        ByteBuf payload = ByteBufAllocator.DEFAULT.buffer();
+        Timer.Context context = getTimerContext("writeObject");
+        ByteBuf payload = Unpooled.buffer();
         Serializers.CORFU.serialize(writeObject, payload);
         WriteRequest wr = new WriteRequest(WriteMode.NORMAL, null, payload);
-        wr.setStreams(streams);
         wr.setRank(rank);
         wr.setBackpointerMap(backpointerMap);
         wr.setGlobalAddress(address);
-        return router.sendMessageAndGetCompletable(CorfuMsgType.WRITE.payloadMsg(wr));
+        CompletableFuture<Boolean> cf = router.sendMessageAndGetCompletable(CorfuMsgType.WRITE.payloadMsg(wr));
+        return cf.thenApply(x -> { context.stop(); return x; });
     }
 
     /**
-     * Asynchronously write to the logging unit.
+     * Asynchronously write an empty payload to the logging unit with ranked address space.
+     * Used from the quorum replication when filling holes or during the first phase of the recovery write.
      *
      * @param address        The address to write to.
+     * @param type           The data type
      * @param streams        The streams, if any, that this write belongs to.
-     * @param rank           The rank of this write (used for quorum
-     *                       replication).
-     * @param buffer         The object, post-serialization, to write.
-     * @param backpointerMap The map of backpointers to write.
-     * @return A CompletableFuture which will complete with the WriteResult once the
-     * write completes.
+     * @param rank           The rank of this write]
      */
-    public CompletableFuture<Boolean> write(long address, Set<UUID> streams, long rank,
-                                            ByteBuf buffer, Map<UUID, Long> backpointerMap) {
-        WriteRequest wr = new WriteRequest(WriteMode.NORMAL, null, buffer);
-        wr.setStreams(streams);
+    public CompletableFuture<Boolean> writeEmptyData(long address, DataType type, Set<UUID> streams, IMetadata.DataRank rank) {
+        Timer.Context context = getTimerContext("writeObject");
+        LogEntry entry = new LogEntry(LogEntry.LogEntryType.NOP);
+        ByteBuf payload = Unpooled.buffer();
+        Serializers.CORFU.serialize(entry, payload);
+        WriteRequest wr = new WriteRequest(WriteMode.NORMAL, type,  null,  payload);
         wr.setRank(rank);
-        wr.setBackpointerMap(backpointerMap);
         wr.setGlobalAddress(address);
-        return router.sendMessageAndGetCompletable(CorfuMsgType.WRITE.payloadMsg(wr));
+        CompletableFuture<Boolean> cf = router.sendMessageAndGetCompletable(CorfuMsgType.WRITE.payloadMsg(wr));
+        return cf.thenApply(x -> { context.stop(); return x; });
     }
 
-    public CompletableFuture<Boolean> writeStream(long address, Map<UUID, Long> streamAddresses,
-                                                  Object object) {
-        ByteBuf payload = ByteBufAllocator.DEFAULT.buffer();
-        Serializers.CORFU.serialize(object, payload);
-        return writeStream(address, streamAddresses, payload);
-    }
 
-    public CompletableFuture<Boolean> writeStream(long address, Map<UUID, Long> streamAddresses,
-                                                  ByteBuf buffer) {
-        WriteRequest wr = new WriteRequest(WriteMode.REPLEX_STREAM, streamAddresses, buffer);
-        wr.setLogicalAddresses(streamAddresses);
-        wr.setGlobalAddress(address);
-        return router.sendMessageAndGetCompletable(CorfuMsgType.WRITE.payloadMsg(wr));
-    }
-
-    public CompletableFuture<Boolean> writeCommit(Map<UUID, Long> streams, long address, boolean commit) {
-        CommitRequest wr = new CommitRequest(streams, address, commit);
-        return router.sendMessageAndGetCompletable(CorfuMsgType.COMMIT.payloadMsg(wr));
+    /**
+     * Asynchronously write to the logging unit.
+     * @param payload   The log data to write to the logging unit.
+     * @return          A CompletableFuture which will complete with the WriteResult once the
+     *                  write completes.
+     */
+    public CompletableFuture<Boolean> write(ILogData payload) {
+        return router.sendMessageAndGetCompletable(CorfuMsgType.WRITE.payloadMsg(new WriteRequest(payload)));
     }
 
     /**
@@ -233,13 +247,27 @@ public class LogUnitClient implements IClient {
      * completes.
      */
     public CompletableFuture<ReadResponse> read(long address) {
-        return router.sendMessageAndGetCompletable(
+        Timer.Context context = getTimerContext("read");
+        CompletableFuture<ReadResponse> cf = router.sendMessageAndGetCompletable(
                 CorfuMsgType.READ_REQUEST.payloadMsg(new ReadRequest(address)));
+
+        return cf.thenApply(x -> { context.stop(); return x; });
     }
 
     public CompletableFuture<ReadResponse> read(UUID stream, Range<Long> offsetRange) {
-        return router.sendMessageAndGetCompletable(
+        Timer.Context context = getTimerContext("readRange");
+        CompletableFuture<ReadResponse> cf = router.sendMessageAndGetCompletable(
                 CorfuMsgType.READ_REQUEST.payloadMsg(new ReadRequest(offsetRange, stream)));
+        return cf.thenApply(x -> { context.stop(); return x; });
+    }
+
+    /**
+     * Get the global tail maximum address the log unit has written.
+     * @return A CompletableFuture which will complete with the globalTail once
+     * received.
+     */
+    public CompletableFuture<Long> getTail() {
+        return router.sendMessageAndGetCompletable(CorfuMsgType.TAIL_REQUEST.msg());
     }
 
     /**
@@ -258,13 +286,17 @@ public class LogUnitClient implements IClient {
      * @param address The address to fill a hole at.
      */
     public CompletableFuture<Boolean> fillHole(long address) {
-        return router.sendMessageAndGetCompletable(
+        Timer.Context context = getTimerContext("fillHole");
+        CompletableFuture<Boolean> cf = router.sendMessageAndGetCompletable(
                 CorfuMsgType.FILL_HOLE.payloadMsg(new FillHoleRequest(null, address)));
+        return cf.thenApply(x -> { context.stop(); return x; });
     }
 
     public CompletableFuture<Boolean> fillHole(UUID streamID, long address) {
-        return router.sendMessageAndGetCompletable(
+        Timer.Context context = getTimerContext("fillHole");
+        CompletableFuture<Boolean> cf = router.sendMessageAndGetCompletable(
                 CorfuMsgType.FILL_HOLE.payloadMsg(new FillHoleRequest(streamID, address)));
+        return cf.thenApply(x -> { context.stop(); return x; });
     }
 
 
@@ -291,5 +323,10 @@ public class LogUnitClient implements IClient {
         router.sendMessage(CorfuMsgType.GC_INTERVAL.payloadMsg(millis));
     }
 
-
+    private Timer.Context getTimerContext(String opName) {
+        Timer t = CorfuRuntime.getMetrics().timer(
+                CorfuRuntime.getMpLUC() +
+                getHost() + ":" + getPort().toString() + "-" + opName);
+        return t.time();
+    }
 }

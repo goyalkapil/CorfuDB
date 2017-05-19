@@ -2,32 +2,21 @@ package org.corfudb.runtime.object.transactions;
 
 import com.google.common.reflect.TypeToken;
 import org.corfudb.runtime.collections.SMRMap;
-import org.corfudb.runtime.exceptions.TransactionAbortedException;
-import org.corfudb.runtime.object.VersionLockedObject;
 import org.junit.Test;
 
-import javax.annotation.Nullable;
 import java.util.HashSet;
-import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicIntegerArray;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.fail;
 
 /**
  * Created by dmalkhi on 12/13/16.
  */
-public class WriteWriteTXConcurrencyTest extends TXConflictScenarios {
+public class WriteWriteTXConcurrencyTest extends TXConflictScenariosTest {
 
-    // override {@link AbstractObjectTest ::TXBegin() } in order to set write-write isolation level
     @Override
-    protected void TXBegin() {
-        getRuntime().getObjectsView().TXBuild()
-                .setType(TransactionType.WRITE_AFTER_WRITE)
-                .begin();
-    }
+    public void TXBegin() { WWTXBegin(); }
 
     @Test
     public void simpleWWTest() {
@@ -43,11 +32,11 @@ public class WriteWriteTXConcurrencyTest extends TXConflictScenarios {
                 valB = new AtomicInteger(0);
 
 
-        t(0, () -> TXBegin());
+        t(0, () -> WWTXBegin());
         t(0, () -> map.put("a", 1));
         t(0, () -> map.put("b", 1));
 
-        t(1, () -> TXBegin());
+        t(1, () -> WWTXBegin());
         t(1, () -> {
             Integer ga  = map.get("a");
             if (ga != null) valA.set(ga);

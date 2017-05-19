@@ -1,36 +1,24 @@
 package org.corfudb.runtime.view;
 
+import com.codahale.metrics.Gauge;
 import com.github.benmanes.caffeine.cache.CacheLoader;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import com.github.benmanes.caffeine.cache.LoadingCache;
-import com.google.common.collect.Range;
-import com.google.common.collect.RangeSet;
-import com.google.common.collect.TreeRangeSet;
-import io.netty.buffer.ByteBuf;
-import io.netty.buffer.PooledByteBufAllocator;
-import lombok.Getter;
-import lombok.Setter;
+
 import lombok.extern.slf4j.Slf4j;
-import org.corfudb.protocols.logprotocol.LogEntry;
 import org.corfudb.protocols.wireprotocol.DataType;
 import org.corfudb.protocols.wireprotocol.ILogData;
-import org.corfudb.protocols.wireprotocol.ILogUnitEntry;
-import org.corfudb.protocols.wireprotocol.InMemoryLogData;
+import org.corfudb.protocols.wireprotocol.IToken;
 import org.corfudb.protocols.wireprotocol.LogData;
 import org.corfudb.runtime.CorfuRuntime;
-import org.corfudb.runtime.clients.LogUnitClient;
 import org.corfudb.runtime.exceptions.OverwriteException;
-import org.corfudb.util.CFUtils;
-import org.corfudb.util.Utils;
-import org.corfudb.util.serializer.Serializers;
+import org.corfudb.runtime.exceptions.WrongEpochException;
 
-import java.time.Duration;
+import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
 import java.util.Map;
-import java.util.Set;
-import java.util.UUID;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.function.Function;
+import java.util.stream.Collectors;
+import java.util.stream.StreamSupport;
 
 
 /**
@@ -46,13 +34,6 @@ public class AddressSpaceView extends AbstractView {
      */
     static LoadingCache<Long, ILogData> readCache;
 
-    /**
-     * Duration before retrying an empty read.
-     */
-    @Getter
-    @Setter
-    Duration emptyDuration = Duration.ofMillis(100L);
-
     public AddressSpaceView(CorfuRuntime runtime) {
         super(runtime);
         // We don't lock readCache, this should be ok in the rare
@@ -62,6 +43,13 @@ public class AddressSpaceView extends AbstractView {
         } else {
             log.debug("Read cache already built, re-using existing read cache.");
         }
+
+        final String pfx = String.format("%s0x%x.cache.", runtime.getMpASV(), this.hashCode());
+        runtime.getMetrics().register(pfx + "cache-size", (Gauge<Long>) () -> readCache.estimatedSize());
+        runtime.getMetrics().register(pfx + "evictions", (Gauge<Long>) () -> readCache.stats().evictionCount());
+        runtime.getMetrics().register(pfx + "hit-rate", (Gauge<Double>) () -> readCache.stats().hitRate());
+        runtime.getMetrics().register(pfx + "hits", (Gauge<Long>) () -> readCache.stats().hitCount());
+        runtime.getMetrics().register(pfx + "misses", (Gauge<Long>) () -> readCache.stats().missCount());
     }
 
     /**
@@ -71,6 +59,7 @@ public class AddressSpaceView extends AbstractView {
         readCache = Caffeine.<Long, ILogData>newBuilder()
                 .<Long, ILogData>weigher((k, v) -> v.getSizeEstimate())
                 .maximumWeight(runtime.getMaxCacheSize())
+                .recordStats()
                 .build(new CacheLoader<Long, ILogData>() {
                     @Override
                     public ILogData load(Long aLong) throws Exception {
@@ -85,66 +74,61 @@ public class AddressSpaceView extends AbstractView {
                 });
     }
 
-    /**
-     * Learn about a stream for the first time.
-     * This method will dump all learned stream entries into the stream.
+    /** Write the given log data using a token, returning
+     * either when the write has been completed successfully,
+     * or throwing an OverwriteException if another value
+     * has been adopted, or a WrongEpochException if the
+     * token epoch is invalid.
      *
-     * @param streamID The ID of a stream.
-     * @return The long
+     * @param token     The token to use for the write.
+     * @param data      The data to write.
+     * @throws OverwriteException   If the globalAddress given
+     *                              by the token has adopted
+     *                              another value.
+     * @throws WrongEpochException  If the token epoch is invalid.
      */
-    private Set<Long> getStream(UUID streamID) {
-        /* TODO : implement in both backpointer and Replex cases */
-        throw new UnsupportedOperationException("unsupported");
-    }
-
-    /**
-     * Learn about a stream for the first time, bypassing the cache.
-     * This method will dump all learned stream entries into the stream.
-     *
-     * @param streamID The ID of a stream.
-     * @return The long
-     */
-    private Map<Long, ILogUnitEntry> fetchStream(UUID streamID) {
-        /* TODO : implement in both backpointer and Replex cases */
-        throw new UnsupportedOperationException("unsupported");
-    }
-
-    /**
-     * Write the given object to an address and streams.
-     *
-     * @param address        An address to write to.
-     * @param stream         The streams which will belong on this entry.
-     * @param data           The data to write.
-     * @param backpointerMap
-     */
-    public void write(long address, Set<UUID> stream, Object data, Map<UUID, Long> backpointerMap,
-                      Map<UUID, Long> streamAddresses)
-            throws OverwriteException {
-        write(address, stream, data, backpointerMap, streamAddresses, null);
-    }
-
-    public void write(long address, Set<UUID> stream, Object data, Map<UUID, Long> backpointerMap,
-                      Map<UUID, Long> streamAddresses, Function<UUID, Object> partialEntryFunction)
-            throws OverwriteException {
-        int numBytes = layoutHelper(l -> AbstractReplicationView.getReplicationView(l, l.getReplicationMode(address),
-                l.getSegment(address))
-                .write(address, stream, data, backpointerMap, streamAddresses, partialEntryFunction));
-
-        // Insert this append to our local cache.
-        if (!runtime.isCacheDisabled()) {
-            InMemoryLogData ld = new InMemoryLogData(DataType.DATA, data);
-            ld.setGlobalAddress(address);
-            ld.setBackpointerMap(backpointerMap);
-            ld.setStreams(stream);
-            ld.setLogicalAddresses(streamAddresses);
-
-            // FIXME
-            if (data instanceof LogEntry) {
-                ((LogEntry) data).setRuntime(runtime);
-                ((LogEntry) data).setEntry(ld);
+    public void write(IToken token, Object data)
+        throws OverwriteException {
+        final ILogData ld = new LogData(data);
+        layoutHelper(l -> {
+            // Check if the token issued is in the same
+            // epoch as the layout we are about to write
+            // to.
+            if (token.getEpoch() != l.getEpoch()) {
+                throw new WrongEpochException(l.getEpoch());
             }
-            readCache.put(address, ld);
+
+            // Set the data to use the token
+            ld.useToken(token);
+
+            // Do the write
+            l.getReplicationMode(token.getTokenValue())
+                        .getReplicationProtocol(runtime)
+                        .write(l, ld);
+
+            return null;
+         });
+
+
+        // Cache the successful write
+        if (!runtime.isCacheDisabled()) {
+            readCache.put(token.getTokenValue(), ld);
         }
+    }
+
+    /** Directly read from the log, returning any
+     * committed value, or NULL, if no value has
+     * been committed.
+     *
+     * @param address   The address to read from.
+     * @return          Committed data stored in the
+     *                  log, or NULL, if no value
+     *                  has been committed.
+     */
+    public @Nullable ILogData peek(final long address) {
+        return layoutHelper(l -> l.getReplicationMode(address)
+                    .getReplicationProtocol(runtime)
+                    .peek(l, address));
     }
 
     /**
@@ -153,50 +137,29 @@ public class AddressSpaceView extends AbstractView {
      * @param address An address to read from.
      * @return A result, which be cached.
      */
-    public ILogData read(long address) {
+    public @Nonnull ILogData read(long address) {
         if (!runtime.isCacheDisabled()) {
-            return readCache.get(address);
+            ILogData data = readCache.get(address);
+            if (data == null || data.getType() == DataType.EMPTY) {
+                throw new RuntimeException("Unexpected return of empty data at address " + address + " on read");
+            }
+            return data;
         }
         return fetch(address);
-    }
-
-    public Map<Long, LogData> read(UUID stream, long offset, long size) {
-        // TODO: We are assuming that we are reading from the most recent segment....
-        return layoutHelper(l -> AbstractReplicationView
-                        .getReplicationView(l, l.getSegments().get(l.getSegments().size() - 1).getReplicationMode(),
-                                l.getSegments().get(l.getSegments().size() - 1))
-                        .read(stream, offset, size)
-        );
     }
 
     /**
      * Read the given object from a range of addresses.
      *
-     * @param addresses An address range to read from.
+     * @param addresses An iterable with addresses to read from
      * @return A result, which be cached.
      */
-    public Map<Long, ILogData> read(RangeSet<Long> addresses) {
-
+    public Map<Long, ILogData> read(Iterable<Long> addresses) {
         if (!runtime.isCacheDisabled()) {
-            return readCache.getAll(Utils.discretizeRangeSet(addresses));
+            return readCache.getAll(addresses);
         }
-        return this.cacheFetch(Utils.discretizeRangeSet(addresses));
+        return this.cacheFetch(addresses);
     }
-
-    /**
-     * Do a bulk read of the stream.
-     *
-     * @param stream The stream to download.
-     * @return A result.
-     */
-    public Map<Long, LogData> readPrefix(UUID stream) {
-        return layoutHelper(l -> AbstractReplicationView
-                        .getReplicationView(l, l.getSegments().get(l.getSegments().size() - 1).getReplicationMode(),
-                                l.getSegments().get(l.getSegments().size() - 1))
-                        .readPrefix(stream)
-        );
-    }
-
 
     /**
      * Fetch an address for insertion into the cache.
@@ -205,17 +168,11 @@ public class AddressSpaceView extends AbstractView {
      * @return A result to be cached. If the readresult is empty,
      * This entry will be scheduled to self invalidate.
      */
-    private LogData cacheFetch(long address) {
+    private @Nonnull ILogData cacheFetch(long address) {
         log.trace("Cache miss @ {}, fetching.", address);
-        LogData result = fetch(address);
+        ILogData result = fetch(address);
         if (result.getType() == DataType.EMPTY) {
-            //schedule an eviction
-            CompletableFuture.runAsync(() -> {
-                log.trace("Evicting empty entry at {}.", address);
-                CFUtils.runAfter(emptyDuration, () -> {
-                    readCache.invalidate(address);
-                });
-            });
+            throw new RuntimeException("Unexpected empty return at " +  address + " from fetch");
         }
         return result;
     }
@@ -227,24 +184,12 @@ public class AddressSpaceView extends AbstractView {
      * @return A result to be cached. If the readresult is empty,
      * This entry will be scheduled to self invalidate.
      */
-    private Map<Long, ILogData> cacheFetch(Iterable<Long> addresses) {
-        // for each address, figure out which replication group it goes to.
-        Map<AbstractReplicationView, RangeSet<Long>> groupMap = new ConcurrentHashMap<>();
-        return layoutHelper(l -> {
-                    for (Long a : addresses) {
-                        AbstractReplicationView v = AbstractReplicationView
-                                .getReplicationView(l, l.getReplicationMode(a), l.getSegment(a));
-                        groupMap.computeIfAbsent(v, x -> TreeRangeSet.<Long>create())
-                                .add(Range.singleton(a));
-                    }
-                    Map<Long, ILogData> result =
-                            new ConcurrentHashMap<>();
-                    for (AbstractReplicationView vk : groupMap.keySet()) {
-                        result.putAll(vk.read(groupMap.get(vk)));
-                    }
-                    return result;
-                }
-        );
+    private @Nonnull Map<Long, ILogData> cacheFetch(Iterable<Long> addresses) {
+        return StreamSupport.stream(addresses.spliterator(), true)
+                .map(address -> layoutHelper(l ->
+                        l.getReplicationMode(address).getReplicationProtocol(runtime)
+                        .read(l, address)))
+                .collect(Collectors.toMap(ILogData::getGlobalAddress, r -> r));
     }
 
 
@@ -254,52 +199,10 @@ public class AddressSpaceView extends AbstractView {
      * @param address An address to read from.
      * @return A result, which will be uncached.
      */
-    public LogData fetch(long address) {
-        return layoutHelper(l -> AbstractReplicationView
-                .getReplicationView(l, l.getReplicationMode(address), l.getSegment(address))
-                .read(address)
+    public @Nonnull ILogData fetch(final long address) {
+        return layoutHelper(l -> l.getReplicationMode(address)
+                .getReplicationProtocol(runtime)
+                .read(l, address)
         );
-    }
-
-    /**
-     * Fill a hole at the given address.
-     *
-     * @param address An address to hole fill at.
-     */
-    public void fillHole(long address)
-            throws OverwriteException {
-        layoutHelper(
-                l -> {
-                    AbstractReplicationView
-                            .getReplicationView(l, l.getReplicationMode(address), l.getSegment(address))
-                            .fillHole(address);
-                    return null;
-                }
-        );
-    }
-
-    public void fillStreamHole(UUID streamID, long address)
-            throws OverwriteException {
-        layoutHelper(
-                l -> {
-                    AbstractReplicationView
-                            .getReplicationView(l, l.getReplicationMode(address), l.getSegment(address))
-                            .fillStreamHole(streamID, address);
-                    return null;
-                }
-        );
-    }
-
-    public void compactAll() {
-        layoutHelper(l -> {
-            for (Layout.LayoutSegment s : l.getSegments()) {
-                for (Layout.LayoutStripe ls : s.getStripes()) {
-                    for (String server : ls.getLogServers()) {
-                        l.getRuntime().getRouter(server).getClient(LogUnitClient.class).forceCompact();
-                    }
-                }
-            }
-            return null;
-        });
     }
 }

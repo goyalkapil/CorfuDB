@@ -6,8 +6,7 @@ import org.corfudb.infrastructure.*;
 import org.junit.After;
 import org.junit.Test;
 
-import java.util.HashMap;
-import java.util.Map;
+import java.util.HashSet;
 import java.util.Set;
 import java.util.concurrent.ExecutionException;
 
@@ -26,12 +25,10 @@ public class ManagementClientTest extends AbstractClientTest {
 
     @Override
     Set<AbstractServer> getServersForTest() {
-        final int MAX_CACHE = 256_000_000;
         ServerContext serverContext = new ServerContextBuilder()
                 .setInitialToken(0)
                 .setMemory(true)
                 .setSingle(true)
-                .setMaxCache(MAX_CACHE)
                 .setServerRouter(serverRouter)
                 .build();
         server = new ManagementServer(serverContext);
@@ -80,9 +77,9 @@ public class ManagementClientTest extends AbstractClientTest {
             throws Exception {
 
         // Since the servers are started as single nodes thus already bootstrapped.
-        Map map = new HashMap<String, Boolean>();
-        map.put("Key", true);
-        assertThat(client.handleFailure(map).get()).isEqualTo(true);
+        Set<String> set = new HashSet<>();
+        set.add("Key");
+        assertThat(client.handleFailure(set).get()).isEqualTo(true);
     }
 
     /**

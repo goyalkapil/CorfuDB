@@ -12,18 +12,18 @@ import org.corfudb.annotations.MutatorAccessor;
 @CorfuObject
 public class ConflictParameterClass {
 
-    @Mutator
-    void mutatorTest(int test1, @ConflictParameter int test2) {
+    @Mutator(name = "mutatorTest")
+    public void mutatorTest(int test1, @ConflictParameter int test2) {
 
     }
 
     @Accessor
-    int accessorTest(@ConflictParameter String test1, String test2) {
+    public int accessorTest(@ConflictParameter String test1, String test2) {
         return 0;
     }
 
-    @MutatorAccessor
-    Object mutatorAccessorTest(@ConflictParameter String test1, String test2) {
+    @MutatorAccessor(name = "mutatorAccessorTest")
+    public Object mutatorAccessorTest(@ConflictParameter String test1, String test2) {
         return 0;
     }
 }

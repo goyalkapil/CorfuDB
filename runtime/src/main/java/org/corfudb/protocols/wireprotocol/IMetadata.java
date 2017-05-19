@@ -1,19 +1,20 @@
 package org.corfudb.protocols.wireprotocol;
 
+import com.esotericsoftware.kryo.NotNull;
 import com.google.common.reflect.TypeToken;
-import lombok.Data;
+import lombok.AllArgsConstructor;
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
+import lombok.Value;
 
+import javax.annotation.Nullable;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.EnumMap;
-import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
@@ -22,7 +23,7 @@ import java.util.stream.Collectors;
  */
 public interface IMetadata {
 
-    public static Map<Byte, LogUnitMetadataType> metadataTypeMap =
+    Map<Byte, LogUnitMetadataType> metadataTypeMap =
             Arrays.<LogUnitMetadataType>stream(LogUnitMetadataType.values())
                     .collect(Collectors.toMap(LogUnitMetadataType::asByte, Function.identity()));
 
@@ -35,12 +36,8 @@ public interface IMetadata {
      */
     @SuppressWarnings("unchecked")
     default Set<UUID> getStreams() {
-        return (Set<UUID>) getMetadataMap().getOrDefault(
-                LogUnitMetadataType.STREAM,
-                // Handle a special condition in the Replex case,
-                // where streams are stored in a stream address map instead.
-                getStreamAddressMap() == null ? Collections.EMPTY_SET :
-                getStreamAddressMap().keySet());
+        return (Set<UUID>) ((Map<UUID, Long>)getMetadataMap().getOrDefault(
+                LogUnitMetadataType.BACKPOINTER_MAP, Collections.emptyMap())).keySet();
     }
 
     /**
@@ -49,16 +46,7 @@ public interface IMetadata {
      * @return          True, if the entry contains the given stream.
      */
     default boolean containsStream(UUID stream) {
-        return getStreams().contains(stream);
-    }
-
-    /**
-     * Set the streams that belong to this append.
-     *
-     * @param streams The set of streams that will belong to this append.
-     */
-    default void setStreams(Set<UUID> streams) {
-        getMetadataMap().put(IMetadata.LogUnitMetadataType.STREAM, streams);
+        return  getBackpointerMap().keySet().contains(stream);
     }
 
     /**
@@ -67,9 +55,10 @@ public interface IMetadata {
      * @return The rank of this append.
      */
     @SuppressWarnings("unchecked")
-    default Long getRank() {
-        return (Long) getMetadataMap().getOrDefault(IMetadata.LogUnitMetadataType.RANK,
-                0L);
+    @Nullable
+    default DataRank getRank() {
+        return (DataRank) getMetadataMap().getOrDefault(LogUnitMetadataType.RANK,
+                null);
     }
 
     /**
@@ -77,28 +66,15 @@ public interface IMetadata {
      *
      * @param rank The rank of this append.
      */
-    default void setRank(long rank) {
-        getMetadataMap().put(IMetadata.LogUnitMetadataType.RANK, rank);
-    }
-
-    /**
-     * Get the logical stream addresses that belong to this append.
-     *
-     * @return A map of UUID to logical stream addresses that belong to this append.
-     */
-    @SuppressWarnings("unchecked")
-    default Map<UUID, Long> getLogicalAddresses() {
-        return (Map<UUID, Long>) getMetadataMap().getOrDefault(IMetadata.LogUnitMetadataType.STREAM_ADDRESSES,
-                Collections.EMPTY_MAP);
-    }
-
-    /**
-     * Set the logical stream addresses that belong to this append.
-     *
-     * @param streams The map from UUID to logical stream addresses that will belong to this append.
-     */
-    default void setLogicalAddresses(Map<UUID, Long> streams) {
-        getMetadataMap().put(IMetadata.LogUnitMetadataType.STREAM_ADDRESSES, streams);
+    default void setRank(@Nullable DataRank rank) {
+        EnumMap<LogUnitMetadataType, Object> map = getMetadataMap();
+        if (rank != null) {
+            map.put(LogUnitMetadataType.RANK, rank);
+        } else {
+            if (map.containsKey(LogUnitMetadataType.RANK)) {
+                map.remove(LogUnitMetadataType.RANK);
+            }
+        }
     }
 
     @SuppressWarnings("unchecked")
@@ -117,39 +93,17 @@ public interface IMetadata {
 
     @SuppressWarnings("unchecked")
     default Long getGlobalAddress() {
-
+        if (getMetadataMap() == null || getMetadataMap().get(LogUnitMetadataType.GLOBAL_ADDRESS) == null) {
+            return -1L;
+        }
         return Optional.ofNullable((Long) getMetadataMap().get(LogUnitMetadataType.GLOBAL_ADDRESS)).orElse((long) -1);
-    }
-
-    @SuppressWarnings("unchecked")
-    default Map<UUID,Long> getStreamAddressMap() {
-        return ((Map<UUID,Long>) getMetadataMap()
-                .get(LogUnitMetadataType.STREAM_ADDRESSES));
-    }
-
-    @SuppressWarnings("unchecked")
-    default Long getStreamAddress(UUID stream) {
-        return ((Map<UUID,Long>) getMetadataMap().get(LogUnitMetadataType.STREAM_ADDRESSES)) == null ? null :
-                ((Map<UUID,Long>) getMetadataMap().get(LogUnitMetadataType.STREAM_ADDRESSES)).get(stream);
-    }
-
-
-    default void clearCommit() {
-        getMetadataMap().put(LogUnitMetadataType.COMMIT, false);
-    }
-
-    default void setCommit() {
-        getMetadataMap().put(LogUnitMetadataType.COMMIT, true);
     }
 
     @RequiredArgsConstructor
     public enum LogUnitMetadataType implements ITypedEnum {
-        STREAM(0, new TypeToken<Set<UUID>>() {}),
-        RANK(1, TypeToken.of(Long.class)),
-        STREAM_ADDRESSES(2, new TypeToken<Map<UUID, Long>>() {}),
+        RANK(1, TypeToken.of(DataRank.class)),
         BACKPOINTER_MAP(3, new TypeToken<Map<UUID, Long>>() {}),
-        GLOBAL_ADDRESS(4, TypeToken.of(Long.class)),
-        COMMIT(5, TypeToken.of(Boolean.class)),
+        GLOBAL_ADDRESS(4, TypeToken.of(Long.class))
         ;
         final int type;
         @Getter
@@ -163,4 +117,32 @@ public interface IMetadata {
                 Arrays.<LogUnitMetadataType>stream(LogUnitMetadataType.values())
                         .collect(Collectors.toMap(LogUnitMetadataType::asByte, Function.identity()));
     }
+
+    @Value
+    @AllArgsConstructor
+    class DataRank implements Comparable<DataRank> {
+        public long rank;
+        @NotNull
+        public UUID uuid;
+
+        public DataRank(long rank) {
+            this(rank, UUID.randomUUID());
+        }
+
+        public DataRank buildHigherRank() {
+            return new DataRank(rank+1, uuid);
+        }
+
+        @Override
+        public int compareTo(DataRank o) {
+            int rankCompared = Long.compare(this.rank, o.rank);
+            if (rankCompared==0) {
+                return uuid.compareTo(o.getUuid());
+            } else {
+                return rankCompared;
+            }
+        }
+    }
+
+    
 }

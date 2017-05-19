@@ -2,12 +2,8 @@ package org.corfudb.runtime.object.transactions;
 
 import lombok.extern.slf4j.Slf4j;
 
-import java.time.Duration;
-import java.util.Deque;
-import java.util.LinkedList;
-import java.util.NavigableSet;
-import java.util.NoSuchElementException;
-import java.util.concurrent.ConcurrentSkipListSet;
+import java.util.*;
+import java.util.stream.Collectors;
 
 /** A class which allows access to transactional contexts, which manage
  * transactions. The static methods of this class provide access to the
@@ -25,25 +21,6 @@ public class TransactionalContext {
     private static final ThreadLocal<Deque<AbstractTransactionalContext>>
             threadTransactionStack = ThreadLocal.withInitial(
             LinkedList<AbstractTransactionalContext>::new);
-
-    /** A navigable set (priority queue) of contexts. The minimum context
-     * indicates how far we should try to keep the undo log up to.
-     */
-    private static final NavigableSet<AbstractTransactionalContext> contextSet =
-            new ConcurrentSkipListSet<>();
-
-    /** Return the oldest snapshot active in the system, or -1L if
-     * there are no active snapshots. */
-    public static long getOldestSnapshot() {
-        if (contextSet.isEmpty()) {
-            return -1L;
-        }
-        try {
-            return contextSet.first().getSnapshotTimestamp();
-        } catch (NoSuchElementException nse) {
-            return -1L;
-        }
-    }
 
     /** Whether or not the current thread is in a nested transaction.
      *
@@ -94,8 +71,8 @@ public class TransactionalContext {
      * @return          The context which was added to the transaction stack.
      */
     public static AbstractTransactionalContext newContext(AbstractTransactionalContext context) {
+        log.debug("TX begin[{}]", context);
         getTransactionStack().addFirst(context);
-        contextSet.add(context);
         return context;
     }
 
@@ -105,7 +82,6 @@ public class TransactionalContext {
      */
     public static AbstractTransactionalContext removeContext() {
         AbstractTransactionalContext r = getTransactionStack().pollFirst();
-        contextSet.remove(r);
         if (getTransactionStack().isEmpty()) {
             synchronized (getTransactionStack())
             {
@@ -113,5 +89,16 @@ public class TransactionalContext {
             }
         }
         return r;
+    }
+
+    /**
+     * Get the transaction stack as a list.
+     * @return  The transaction stack as a list.
+     */
+    public static List<AbstractTransactionalContext> getTransactionStackAsList() {
+        List<AbstractTransactionalContext> listReverse =
+                getTransactionStack().stream().collect(Collectors.toList());
+        Collections.reverse(listReverse);
+        return listReverse;
     }
 }

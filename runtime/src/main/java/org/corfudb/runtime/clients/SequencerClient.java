@@ -1,15 +1,15 @@
 package org.corfudb.runtime.clients;
 
-import com.google.common.collect.ImmutableSet;
 import io.netty.channel.ChannelHandlerContext;
-import lombok.Data;
 import lombok.Getter;
 import lombok.Setter;
-import org.corfudb.protocols.wireprotocol.*;
+import org.corfudb.protocols.wireprotocol.CorfuMsgType;
+import org.corfudb.protocols.wireprotocol.CorfuPayloadMsg;
+import org.corfudb.protocols.wireprotocol.TokenRequest;
+import org.corfudb.protocols.wireprotocol.TokenResponse;
+import org.corfudb.protocols.wireprotocol.TxResolutionInfo;
 
 import java.lang.invoke.MethodHandles;
-import java.util.Collections;
-import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -41,23 +41,20 @@ public class SequencerClient implements IClient {
 
     public CompletableFuture<TokenResponse> nextToken(Set<UUID> streamIDs, long numTokens) {
         return router.sendMessageAndGetCompletable(
-                CorfuMsgType.TOKEN_REQ.payloadMsg(new TokenRequest(numTokens, streamIDs, false, false)));
+                CorfuMsgType.TOKEN_REQ.payloadMsg(new TokenRequest(numTokens, streamIDs)));
     }
 
-    public CompletableFuture<TokenResponse> nextToken(Set<UUID> streamIDs, long numTokens,
-                                                      boolean overwrite,
-                                                      boolean replexOverwrite) {
+    public CompletableFuture<TokenResponse> nextToken(Set<UUID> streamIDs, long numTokens, TxResolutionInfo conflictInfo) {
         return router.sendMessageAndGetCompletable(
-                CorfuMsgType.TOKEN_REQ.payloadMsg(new TokenRequest(numTokens, streamIDs, overwrite, replexOverwrite)));
+                CorfuMsgType.TOKEN_REQ.payloadMsg(new TokenRequest(numTokens, streamIDs, conflictInfo)));
     }
 
-    public CompletableFuture<TokenResponse> nextToken(Set<UUID> streamIDs, long numTokens,
-                                                      boolean overwrite,
-                                                      boolean replexOverwrite,
-                                                      TxResolutionInfo conflictInfo) {
-        return router.sendMessageAndGetCompletable(
-                CorfuMsgType.TOKEN_REQ.payloadMsg(new TokenRequest(numTokens, streamIDs,
-                        overwrite, replexOverwrite,
-                        conflictInfo)));
+    /**
+     * Resets the sequencer with the specified initialToken
+     * @param initialToken  Token Number which the sequencer starts distributing.
+     * @return A CompletableFuture which completes once the sequencer is reset.
+     */
+    public CompletableFuture<Boolean> reset(Long initialToken) {
+        return router.sendMessageAndGetCompletable(CorfuMsgType.RESET_SEQUENCER.payloadMsg(initialToken));
     }
 }

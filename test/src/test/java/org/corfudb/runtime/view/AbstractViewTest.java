@@ -75,6 +75,9 @@ public abstract class AbstractViewTest extends AbstractCorfuTest {
         // Force all new CorfuRuntimes to override the getRouterFn
         CorfuRuntime.overrideGetRouterFunction = this::getRouterFunction;
         runtime = new CorfuRuntime(getDefaultEndpoint());
+        // Default number of times to read before hole filling to 0
+        // (most aggressive, to surface concurrency issues).
+        runtime.getParameters().setHoleFillRetry(0);
     }
 
     /** Function for obtaining a router, given a runtime and an endpoint.
@@ -108,8 +111,8 @@ public abstract class AbstractViewTest extends AbstractCorfuTest {
     @Before
     public void resetTests() {
         testServerMap.clear();
-        runtime.parseConfigurationString(getDefaultConfigurationString())
-                .setCacheDisabled(true); // Disable cache during unit tests to fully stress the system.
+        runtime.parseConfigurationString(getDefaultConfigurationString());
+       //         .setCacheDisabled(true); // Disable cache during unit tests to fully stress the system.
         runtime.getAddressSpaceView().resetCaches();
     }
 
@@ -287,6 +290,16 @@ public abstract class AbstractViewTest extends AbstractCorfuTest {
      */
     public void addClientRule(CorfuRuntime r, TestRule rule) {
         runtimeRouterMap.get(r).values().forEach(x -> x.rules.add(rule));
+    }
+
+    /** Add a rule to a particular router in a particular runtime.
+     *
+     * @param r                     The runtime to install the rule to
+     * @param clientRouterEndpoint  The Client router endpoint to install the rule to
+     * @param rule                  The rule to install.
+     */
+    public void addClientRule(CorfuRuntime r, String clientRouterEndpoint, TestRule rule) {
+        runtimeRouterMap.get(r).get(clientRouterEndpoint).rules.add(rule);
     }
 
     /** Clear rules for a particular server.

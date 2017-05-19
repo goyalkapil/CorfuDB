@@ -3,7 +3,6 @@ package org.corfudb.runtime.object.transactions;
 import com.google.common.collect.ImmutableSet;
 import lombok.Getter;
 import org.corfudb.protocols.logprotocol.SMREntry;
-import org.corfudb.runtime.exceptions.NoRollbackException;
 import org.corfudb.runtime.object.ICorfuSMRAccess;
 import org.corfudb.runtime.object.ICorfuSMRProxyInternal;
 
@@ -41,51 +40,10 @@ public class SnapshotTransactionalContext extends AbstractTransactionalContext {
         // In snapshot transactions, there are no conflicts.
         // Hence, we do not need to add this access to a conflict set
         // do not add: addToReadSet(proxy, conflictObject);
-
-        return proxy.getUnderlyingObject().optimisticallyReadThenReadLockThenWriteOnFail(
-                (v, o) -> {
-                    // We're lucky and the object has not been modified AND
-                    // it's the right version.
-                    if (v == getSnapshotTimestamp() &&
-                            !proxy.getUnderlyingObject().isOptimisticallyModifiedUnsafe()) {
-                        return accessFunction.access(o);
-                    }
-                    throw new ConcurrentModificationException();
-                },
-                (v, o) -> {
-                    // We're lucky and the object has not been modified AND
-                    // it's the right version. (Another writer modified it to this state).
-                    if (v == getSnapshotTimestamp() &&
-                            !proxy.getUnderlyingObject().isOptimisticallyModifiedUnsafe()) {
-                        return accessFunction.access(o);
-                    }
-                    // Otherwise, we need to roll forward or backward.
-                    // First undo any optimistic changes.
-                    if (proxy.getUnderlyingObject().isOptimisticallyModifiedUnsafe()) {
-                        try {
-                            proxy.getUnderlyingObject().optimisticRollbackUnsafe();
-                        } catch (NoRollbackException nre) {
-                            // guess our only option is to start from scratch.
-                            proxy.resetObjectUnsafe(proxy.getUnderlyingObject());
-                        }
-                    }
-                    // Next check the version, if it is ahead, try undo
-                    // We don't support this yet, so we just reset
-                    if (proxy.getVersion() > getSnapshotTimestamp()) {
-                        proxy.resetObjectUnsafe(proxy.getUnderlyingObject());
-                    }
-
-                    // Now we sync forward if we are behind
-                    if (proxy.getVersion() < getSnapshotTimestamp()) {
-                        proxy.syncObjectUnsafe(proxy.getUnderlyingObject(),
-                                getSnapshotTimestamp());
-                    }
-
-                    // Now we do the access
-                    return accessFunction.access(proxy.getUnderlyingObject()
-                            .getObjectUnsafe());
-                }
-        );
+        return proxy.getUnderlyingObject().access(o -> o.getVersionUnsafe() == getSnapshotTimestamp()
+                        && !o.isOptimisticallyModifiedUnsafe(),
+                o -> o.syncObjectUnsafe(getSnapshotTimestamp()),
+                o -> accessFunction.access(o));
     }
 
     /**

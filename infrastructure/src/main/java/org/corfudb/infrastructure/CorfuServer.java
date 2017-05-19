@@ -14,7 +14,6 @@ import io.netty.channel.socket.nio.NioServerSocketChannel;
 import io.netty.handler.codec.LengthFieldBasedFrameDecoder;
 import io.netty.handler.codec.LengthFieldPrepender;
 import io.netty.handler.ssl.SslContext;
-import io.netty.handler.ssl.SslContextBuilder;
 import io.netty.handler.ssl.SslHandler;
 import io.netty.util.concurrent.DefaultEventExecutorGroup;
 import io.netty.util.concurrent.EventExecutorGroup;
@@ -31,13 +30,6 @@ import org.fusesource.jansi.AnsiConsole;
 import org.slf4j.LoggerFactory;
 
 import java.io.File;
-import java.io.FileInputStream;
-import java.nio.file.Files;
-import java.nio.file.Paths;
-import java.security.KeyStore;
-import java.security.KeyStoreException;
-import java.security.NoSuchAlgorithmException;
-import java.security.UnrecoverableKeyException;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -98,7 +90,7 @@ public class CorfuServer {
             "Corfu Server, the server for the Corfu Infrastructure.\n"
                     + "\n"
                     + "Usage:\n"
-                    + "\tcorfu_server (-l <path>|-m) [-nsQ] [-a <address>] [-t <token>] [-c <size>] [-k seconds] [-d <level>] [-p <seconds>] [-M <address>:<port>] [-e [-u <keystore> -f <keystore_password_file>] [-r <truststore> -w <truststore_password_file>] [-b] [-g -o <username_file> -j <password_file>] [-x <ciphers>] [-z <tls-protocols>]] <port>\n"
+                    + "\tcorfu_server (-l <path>|-m) [-nsQ] [-a <address>] [-t <token>] [-c <ratio>] [-k seconds] [-d <level>] [-p <seconds>] [-M <address>:<port>] [-e [-u <keystore> -f <keystore_password_file>] [-r <truststore> -w <truststore_password_file>] [-b] [-g -o <username_file> -j <password_file>] [-x <ciphers>] [-z <tls-protocols>]] <port>\n"
                     + "\n"
                     + "Options:\n"
                     + " -l <path>, --log-path=<path>                                                           Set the path to the storage file for the log unit.\n"
@@ -107,9 +99,10 @@ public class CorfuServer {
                     + " -a <address>, --address=<address>                                                      IP address to advertise to external clients [default: localhost].\n"
                     + " -m, --memory                                                                           Run the unit in-memory (non-persistent).\n"
                     + "                                                                                        Data will be lost when the server exits!\n"
-                    + " -c <size>, --max-cache=<size>                                                          The size of the in-memory cache to serve requests from -\n"
-                    + "                                                                                        If there is no log, then this is the max size of the log unit\n"
-                    + "                                                                                        evicted entries will be auto-trimmed. [default: 1000000000].\n"
+                    + " -c <ratio>, --cache-heap-ratio=<ratio>                                                 The ratio of jvm max heap size we will use for the the in-memory cache to serve requests from -\n"
+                    + "                                                                                        (e.g. ratio = 0.5 means the cache size will be 0.5 * jvm max heap size\n"
+                    + "                                                                                        If there is no log, then this will be the size of the log unit\n"
+                    + "                                                                                        evicted entries will be auto-trimmed. [default: 0.5].\n"
                     + " -t <token>, --initial-token=<token>                                                    The first token the sequencer will issue, or -1 to recover\n"
                     + "                                                                                        from the log. [default: -1].\n"
                     + " -p <seconds>, --compact=<seconds>                                                      The rate the log unit should compact entries (find the,\n"

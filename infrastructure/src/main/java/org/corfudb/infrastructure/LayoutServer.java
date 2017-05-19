@@ -4,18 +4,10 @@ import io.netty.channel.ChannelHandlerContext;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 import org.corfudb.protocols.wireprotocol.*;
-import org.corfudb.protocols.wireprotocol.CorfuMsgType;
-import org.corfudb.protocols.wireprotocol.CorfuMsg;
-import org.corfudb.protocols.wireprotocol.LayoutMsg;
 import org.corfudb.runtime.view.Layout;
 import org.corfudb.runtime.view.Layout.LayoutSegment;
 
-import java.io.IOException;
 import java.lang.invoke.MethodHandles;
-import java.nio.file.DirectoryStream;
-import java.nio.file.FileSystems;
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.util.*;
 
 /**
@@ -74,6 +66,8 @@ public class LayoutServer extends AbstractServer {
     private CorfuMsgHandler handler = new CorfuMsgHandler()
             .generateHandlers(MethodHandles.lookup(), this);
 
+    private static final String metricsPrefix = "corfu.server.layout.";
+
     public LayoutServer(ServerContext serverContext) {
         this.opts = serverContext.getServerConfig();
         this.serverContext = serverContext;
@@ -111,8 +105,9 @@ public class LayoutServer extends AbstractServer {
     }
 
     // Helper Methods
-    @ServerHandler(type=CorfuMsgType.LAYOUT_REQUEST)
-    public synchronized void handleMessageLayoutRequest(CorfuPayloadMsg<Long> msg, ChannelHandlerContext ctx, IServerRouter r) {
+    @ServerHandler(type=CorfuMsgType.LAYOUT_REQUEST, opTimer=metricsPrefix + "request")
+    public synchronized void handleMessageLayoutRequest(CorfuPayloadMsg<Long> msg, ChannelHandlerContext ctx, IServerRouter r,
+                                                        boolean isMetricsEnabled) {
         if (!checkBootstrap(msg, ctx, r)) { return; }
         long epoch = msg.getPayload();
         if (epoch <= serverContext.getServerEpoch()) {
@@ -121,12 +116,10 @@ public class LayoutServer extends AbstractServer {
         } else {
             // else the client is somehow ahead of the server.
             //TODO figure out a strategy to deal with this situation
-            // Very odd ... if we don't send any response here, we hang the OTP mailbox thread.
             long serverEpoch = serverContext.getServerEpoch();
             r.sendResponse(ctx, msg, new CorfuPayloadMsg<>(CorfuMsgType.WRONG_EPOCH, serverEpoch));
             log.warn("Message Epoch {} ahead of Server epoch {}", epoch, serverContext.getServerConfig());
         }
-
     }
 
     /**
@@ -136,8 +129,9 @@ public class LayoutServer extends AbstractServer {
      * @param ctx
      * @param r
      */
-    @ServerHandler(type=CorfuMsgType.LAYOUT_BOOTSTRAP)
-    public synchronized void handleMessageLayoutBootstrap(CorfuPayloadMsg<LayoutBootstrapRequest> msg, ChannelHandlerContext ctx, IServerRouter r) {
+    @ServerHandler(type=CorfuMsgType.LAYOUT_BOOTSTRAP, opTimer=metricsPrefix + "bootstrap")
+    public synchronized void handleMessageLayoutBootstrap(CorfuPayloadMsg<LayoutBootstrapRequest> msg, ChannelHandlerContext ctx, IServerRouter r,
+                                                          boolean isMetricsEnabled) {
         if (getCurrentLayout() == null) {
             log.info("Bootstrap with new layout={}, {}",  msg.getPayload().getLayout(), msg);
             setCurrentLayout(msg.getPayload().getLayout());
@@ -157,8 +151,9 @@ public class LayoutServer extends AbstractServer {
      * @param ctx       The channel context
      * @param r         The server router.
      */
-    @ServerHandler(type=CorfuMsgType.SET_EPOCH)
-    public synchronized void handleMessageSetEpoch(CorfuPayloadMsg<Long> msg, ChannelHandlerContext ctx, IServerRouter r) {
+    @ServerHandler(type=CorfuMsgType.SET_EPOCH, opTimer=metricsPrefix + "set-epoch")
+    public synchronized void handleMessageSetEpoch(CorfuPayloadMsg<Long> msg, ChannelHandlerContext ctx, IServerRouter r,
+                                                   boolean isMetricsEnabled) {
         if (!checkBootstrap(msg, ctx, r)) { return; }
         long serverEpoch = getServerEpoch();
         if (msg.getPayload() >= serverEpoch) {
@@ -178,8 +173,9 @@ public class LayoutServer extends AbstractServer {
      * @param r
      */
     // TODO this can work under a separate lock for this step as it does not change the global components
-    @ServerHandler(type=CorfuMsgType.LAYOUT_PREPARE)
-    public synchronized void handleMessageLayoutPrepare(CorfuPayloadMsg<LayoutPrepareRequest> msg, ChannelHandlerContext ctx, IServerRouter r) {
+    @ServerHandler(type=CorfuMsgType.LAYOUT_PREPARE, opTimer=metricsPrefix + "prepare")
+    public synchronized void handleMessageLayoutPrepare(CorfuPayloadMsg<LayoutPrepareRequest> msg, ChannelHandlerContext ctx, IServerRouter r,
+                                                        boolean isMetricsEnabled) {
         // Check if the prepare is for the correct epoch
         if (!checkBootstrap(msg, ctx, r)) { return; }
         Rank prepareRank = new Rank(msg.getPayload().getRank(), msg.getClientID());
@@ -189,7 +185,7 @@ public class LayoutServer extends AbstractServer {
         long serverEpoch = getServerEpoch();
         if (msg.getPayload().getEpoch() != serverEpoch) {
             r.sendResponse(ctx, msg, new CorfuPayloadMsg<>(CorfuMsgType.WRONG_EPOCH, serverEpoch));
-            log.trace("Incoming message with wrong epoch, got {}, expected {}, message was: {}", msg.getEpoch(), serverEpoch, msg);
+            log.trace("Incoming message with wrong epoch, got {}, expected {}, message was: {}", msg.getPayload().getEpoch(), serverEpoch, msg);
             return;
         }
 
@@ -212,8 +208,9 @@ public class LayoutServer extends AbstractServer {
      * @param ctx
      * @param r
      */
-    @ServerHandler(type=CorfuMsgType.LAYOUT_PROPOSE)
-    public synchronized void handleMessageLayoutPropose(CorfuPayloadMsg<LayoutProposeRequest> msg, ChannelHandlerContext ctx, IServerRouter r) {
+    @ServerHandler(type=CorfuMsgType.LAYOUT_PROPOSE, opTimer=metricsPrefix + "propose")
+    public synchronized void handleMessageLayoutPropose(CorfuPayloadMsg<LayoutProposeRequest> msg, ChannelHandlerContext ctx, IServerRouter r,
+                                                        boolean isMetricsEnabled) {
         // Check if the propose is for the correct epoch
         if (!checkBootstrap(msg, ctx, r)) { return; }
         Rank proposeRank = new Rank(msg.getPayload().getRank(), msg.getClientID());
@@ -225,7 +222,7 @@ public class LayoutServer extends AbstractServer {
 
         if (msg.getPayload().getEpoch() != serverEpoch) {
             r.sendResponse(ctx, msg, new CorfuPayloadMsg<>(CorfuMsgType.WRONG_EPOCH, serverEpoch));
-            log.trace("Incoming message with wrong epoch, got {}, expected {}, message was: {}", proposeLayout.getEpoch(), serverEpoch, msg);
+            log.trace("Incoming message with wrong epoch, got {}, expected {}, message was: {}", msg.getPayload().getEpoch(), serverEpoch, msg);
             return;
         }
         // This is a propose. If no prepare, reject.
@@ -264,8 +261,9 @@ public class LayoutServer extends AbstractServer {
     // TODO as this message is not set to ignore EPOCH.
     // TODO How do we handle holes in history if let in layout commit message. Maybe we have a hole filling process
     // TODO how do reject the older epoch commits, should it be an explicit NACK.
-    @ServerHandler(type=CorfuMsgType.LAYOUT_COMMITTED)
-    public synchronized void handleMessageLayoutCommit(CorfuPayloadMsg<LayoutCommittedRequest> msg, ChannelHandlerContext ctx, IServerRouter r) {
+    @ServerHandler(type=CorfuMsgType.LAYOUT_COMMITTED, opTimer=metricsPrefix + "committed")
+    public synchronized void handleMessageLayoutCommit(CorfuPayloadMsg<LayoutCommittedRequest> msg, ChannelHandlerContext ctx, IServerRouter r,
+                                                       boolean isMetricsEnabled) {
         Layout commitLayout = msg.getPayload().getLayout();
         if (!checkBootstrap(msg, ctx, r)) { return; }
         long serverEpoch = getServerEpoch();

@@ -1,21 +1,21 @@
 package org.corfudb.runtime.view;
 
 import lombok.extern.slf4j.Slf4j;
-import org.corfudb.protocols.logprotocol.IDivisibleEntry;
 import org.corfudb.protocols.logprotocol.StreamCOWEntry;
-import org.corfudb.protocols.wireprotocol.TokenResponse;
-import org.corfudb.protocols.wireprotocol.TxResolutionInfo;
+import org.corfudb.protocols.wireprotocol.*;
 import org.corfudb.runtime.CorfuRuntime;
+import org.corfudb.runtime.exceptions.AbortCause;
 import org.corfudb.runtime.exceptions.OverwriteException;
-import org.corfudb.runtime.exceptions.ReplexOverwriteException;
-import org.corfudb.runtime.view.stream.BackpointerStreamView;
+import org.corfudb.runtime.exceptions.TransactionAbortedException;
 import org.corfudb.runtime.view.stream.IStreamView;
-import org.corfudb.runtime.view.stream.ReplexStreamView;
+import org.corfudb.util.Utils;
 
+import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
 import java.util.Collections;
 import java.util.Set;
 import java.util.UUID;
-import java.util.function.Function;
+import java.util.stream.Collectors;
 
 /**
  * Created by mwei on 12/11/15.
@@ -39,13 +39,9 @@ public class StreamsView {
      * @return A view
      */
     public IStreamView get(UUID stream) {
-        // Todo(Maithem): we should have a mechanism for proper exclusion of a set of ids reserved by the system
-        if (runtime.getLayoutView().getLayout().getSegments().get(
+        return runtime.getLayoutView().getLayout().getSegments().get(
                 runtime.getLayoutView().getLayout().getSegments().size() - 1)
-                .getReplicationMode() == Layout.ReplicationMode.REPLEX) {
-            return new ReplexStreamView(runtime, stream);
-        }
-        return new BackpointerStreamView(runtime, stream);
+                .getReplicationMode().getStreamView(runtime, stream);
     }
 
     /**
@@ -60,178 +56,90 @@ public class StreamsView {
         while (!written) {
             TokenResponse tokenResponse =
                     runtime.getSequencerView().nextToken(Collections.singleton(destination), 1);
-            if (!tokenResponse.getBackpointerMap().get(destination).equals(-1L)) {
-                try {
-                    runtime.getAddressSpaceView().fillHole(tokenResponse.getToken());
-                } catch (OverwriteException oe) {
-                    log.trace("Attempted to hole fill due to already-existing stream but hole filled by other party");
-                }
+            if (tokenResponse.getBackpointerMap().get(destination) != null &&
+                    Address.isAddress(tokenResponse.getBackpointerMap().get(destination))) {
+                // Reading from this address will cause a hole fill
+                runtime.getAddressSpaceView().read(tokenResponse.getTokenValue());
                 throw new RuntimeException("Stream already exists!");
             }
             StreamCOWEntry entry = new StreamCOWEntry(source, timestamp);
+            TokenResponse cowToken = new TokenResponse(tokenResponse.getTokenValue(), tokenResponse.getEpoch(),
+                    Collections.singletonMap(destination, Address.COW_BACKPOINTER));
             try {
-                runtime.getAddressSpaceView().write(tokenResponse.getToken(), Collections.singleton(destination),
-                        entry, tokenResponse.getBackpointerMap(), tokenResponse.getStreamAddresses());
+                runtime.getAddressSpaceView().write(cowToken, entry);
                 written = true;
             } catch (OverwriteException oe) {
                 log.debug("hole fill during COW entry append, retrying...");
             }
         }
-        return new BackpointerStreamView(runtime, destination);
+        return get(destination);
     }
 
-    /**
-     * Write an object to multiple streams, retuning the physical address it
-     * was written at.
-     * <p>
-     * Note: While the completion of this operation guarantees that the append
-     * has been persisted, it DOES NOT guarantee that the object has been
-     * written to the stream. For example, another client may have deleted
-     * the stream.
-     *
-     * @param object The object to append to the stream.
-     * @return The address this
+    /** Append to multiple streams simultaneously, possibly providing
+     * information on how to resolve conflicts.
+     * @param streamIDs     The streams to append to.
+     * @param object        The object to append to each stream.
+     * @param conflictInfo  Conflict information for the sequencer to check.
+     * @return              The address the entry was written to.
+     * @throws TransactionAbortedException      If the transaction was aborted by
+     *                                          the sequencer.
      */
-    public long write(Set<UUID> streamIDs, Object object) {
-        return acquireAndWrite(streamIDs, object, t -> true, t -> true);
-    }
+    public long append(@Nonnull Set<UUID> streamIDs, @Nonnull Object object,
+                       @Nullable TxResolutionInfo conflictInfo)
+        throws TransactionAbortedException {
 
-    public void writeAt(TokenResponse address, Set<UUID> streamIDs, Object object) throws OverwriteException {
-        Function<UUID, Object> partialEntryFunction =
-                object instanceof IDivisibleEntry ? ((IDivisibleEntry)object)::divideEntry : null;
-        runtime.getAddressSpaceView().write(address.getToken(), streamIDs,
-                object, address.getBackpointerMap(), address.getStreamAddresses(), partialEntryFunction);
-    }
+        // Go to the sequencer, grab an initial token.
+        TokenResponse tokenResponse = conflictInfo == null ?
+                // Token w/o conflict info
+                runtime.getSequencerView().nextToken(streamIDs, 1) :
+                // Token w/ conflict info
+                runtime.getSequencerView().nextToken(streamIDs, 1, conflictInfo);
 
-    /**
-     * Write an object to multiple streams, retuning the physical address it
-     * was written at.
-     * <p>
-     * Note: While the completion of this operation guarantees that the append
-     * has been persisted, it DOES NOT guarantee that the object has been
-     * written to the stream. For example, another client may have deleted
-     * the stream.
-     *
-     * @param object The object to append to the stream.
-     * @return The address this
-     */
-    public long acquireAndWrite(Set<UUID> streamIDs, Object object,
-                                Function<TokenResponse, Boolean> acquisitionCallback,
-                                Function<TokenResponse, Boolean> deacquisitionCallback) {
-        return acquireAndWrite(streamIDs, object,
-                acquisitionCallback, deacquisitionCallback,null);
-    }
-
-    public long acquireAndWrite(Set<UUID> streamIDs, Object object,
-                                Function<TokenResponse, Boolean> acquisitionCallback,
-                                Function<TokenResponse, Boolean> deacquisitionCallback,
-                                TxResolutionInfo conflictInfo) {
-        boolean replexOverwrite = false;
-        boolean overwrite = false;
-        TokenResponse tokenResponse = null;
+        // Until we've succeeded
         while (true) {
-            if (conflictInfo != null) {
-                long token;
-                if (overwrite) {
-                    TokenResponse temp =
-                            runtime.getSequencerView().nextToken(streamIDs, 1, true, false, conflictInfo);
-                    token = temp.getToken();
-                    tokenResponse = new TokenResponse(token, temp.getBackpointerMap(), tokenResponse.getStreamAddresses());
-                } else {
-                    tokenResponse =
-                            runtime.getSequencerView().nextToken(streamIDs, 1, false, false, conflictInfo);
-                    token = tokenResponse.getToken();
-                }
-                log.trace("Write[{}]: acquired token = {}, global addr: {}", streamIDs, tokenResponse, token);
-                if (acquisitionCallback != null) {
-                    if (!acquisitionCallback.apply(tokenResponse)) {
-                        log.trace("Acquisition rejected token, hole filling acquired address.");
-                        try {
-                            runtime.getAddressSpaceView().fillHole(token);
-                        } catch (OverwriteException oe) {
-                            log.trace("Hole fill completed by remote client.");
-                        }
-                        return -1L;
-                    }
-                }
-                if (token == -1L) {
-                    if (deacquisitionCallback != null && !deacquisitionCallback.apply(tokenResponse)) {
-                        log.trace("Acquisition rejected overwrite at {}, not retrying.", token);
-                    }
-                    return -1L;
-                }
-                try {
-                    runtime.getAddressSpaceView().write(token, streamIDs,
-                            object, tokenResponse.getBackpointerMap(), tokenResponse.getStreamAddresses());
-                    return token;
-                } catch (ReplexOverwriteException re) {
-                    if (deacquisitionCallback != null && !deacquisitionCallback.apply(tokenResponse)) {
-                        log.trace("Acquisition rejected overwrite at {}, not retrying.", token);
-                        return -1L;
-                    }
-                    replexOverwrite = true;
-                    overwrite = false;
-                } catch (OverwriteException oe) {
-                    if (deacquisitionCallback != null && !deacquisitionCallback.apply(tokenResponse)) {
-                        log.trace("Acquisition rejected overwrite at {}, not retrying.", token);
-                        return -1L;
-                    }
-                    replexOverwrite = false;
-                    overwrite = true;
-                    log.debug("Overwrite occurred at {}, retrying.", token);
-                }
-            } else {
-                long token;
-                if (replexOverwrite) {
-                    tokenResponse =
-                            runtime.getSequencerView().nextToken(streamIDs, 1, false, true);
-                    token = tokenResponse.getToken();
-                } else if (overwrite) {
-                    TokenResponse temp =
-                            runtime.getSequencerView().nextToken(streamIDs, 1, true, false);
-                    token = temp.getToken();
-                    tokenResponse = new TokenResponse(token, temp.getBackpointerMap(), tokenResponse.getStreamAddresses());
-                } else {
-                    tokenResponse =
-                            runtime.getSequencerView().nextToken(streamIDs, 1);
-                    token = tokenResponse.getToken();
-                }
-                log.trace("Write[{}]: acquired token = {}, global addr: {}", streamIDs, tokenResponse, token);
-                if (acquisitionCallback != null) {
-                    if (!acquisitionCallback.apply(tokenResponse)) {
-                        log.trace("Acquisition rejected token, hole filling acquired address.");
-                        try {
-                            runtime.getAddressSpaceView().fillHole(token);
-                        } catch (OverwriteException oe) {
-                            log.trace("Hole fill completed by remote client.");
-                        }
-                        return -1L;
-                    }
-                }
-                try {
-                    Function<UUID, Object> partialEntryFunction =
-                            object instanceof IDivisibleEntry ? ((IDivisibleEntry)object)::divideEntry : null;
-                    runtime.getAddressSpaceView().write(token, streamIDs,
-                            object, tokenResponse.getBackpointerMap(), tokenResponse.getStreamAddresses(), partialEntryFunction);
-                    return token;
-                } catch (ReplexOverwriteException re) {
-                    if (deacquisitionCallback != null && !deacquisitionCallback.apply(tokenResponse)) {
-                        log.trace("Acquisition rejected overwrite at {}, not retrying.", token);
-                        return -1L;
-                    }
-                    replexOverwrite = true;
-                    overwrite = false;
-                } catch (OverwriteException oe) {
-                    if (deacquisitionCallback != null && !deacquisitionCallback.apply(tokenResponse)) {
-                        log.trace("Acquisition rejected overwrite at {}, not retrying.", token);
-                        return -1L;
-                    }
-                    replexOverwrite = false;
-                    overwrite = true;
-                    log.debug("Overwrite occurred at {}, retrying.", token);
-                }
+
+            // Is our token a valid type?
+            if (tokenResponse.getRespType() == TokenType.TX_ABORT_CONFLICT)
+                throw new TransactionAbortedException(
+                        conflictInfo,
+                        tokenResponse.getConflictKey(),
+                        AbortCause.CONFLICT
+                );
+
+            if (tokenResponse.getRespType() == TokenType.TX_ABORT_NEWSEQ)
+                throw new TransactionAbortedException(
+                        conflictInfo,
+                        tokenResponse.getConflictKey(),
+                        AbortCause.NEW_SEQUENCER
+                );
+
+            // Attempt to write to the log
+            try {
+                runtime.getAddressSpaceView().write(tokenResponse, object);
+                // If we're here, we succeeded, return the acquired token
+                return tokenResponse.getTokenValue();
+            } catch (OverwriteException oe) {
+                log.trace("Overwrite[{}]: streams {}", tokenResponse.getTokenValue(),
+                        streamIDs.stream().map(Utils::toReadableID).collect(Collectors.toSet()));
+                // On retry, check for conflicts only from the previous
+                // attempt position
+                conflictInfo.setSnapshotTimestamp(tokenResponse.getToken().getTokenValue());
+
+                // We were overwritten, get a new token and try again.
+                TokenResponse temp = conflictInfo == null ?
+                        // Token w/o conflict info
+                        runtime.getSequencerView().nextToken(streamIDs, 1) :
+                        // Token w/ conflict info
+                        runtime.getSequencerView().nextToken(streamIDs, 1, conflictInfo);
+
+                // We need to fix the token (to use the stream addresses- may
+                // eventually be deprecated since these are no longer used)
+                tokenResponse = new TokenResponse(
+                        temp.getRespType(), tokenResponse.getConflictKey(),
+                        temp.getToken(), temp.getBackpointerMap());
             }
         }
+
     }
 
 
